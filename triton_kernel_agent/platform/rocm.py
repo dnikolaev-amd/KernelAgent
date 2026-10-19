@@ -71,19 +71,30 @@ def detect_amd_gpu_name() -> str | None:
         if not torch.cuda.is_available():
             return None
         name = torch.cuda.get_device_name(0)
-        if "AMD" in name or "Instinct" in name or "Radeon" in name:
+        lowered = name.lower()
+        if "AMD" in name or "Instinct" in name or "Radeon" in name or "gfx" in lowered:
             return name
         return None
     except Exception:
         return None
 
 
+# gfx942 is shared by MI300X and MI300A. The discrete MI300X entry is the
+# default when the driver only reports the ISA name.
+_GFX_TO_SPEC_NAME = {
+    "gfx942": "AMD Instinct MI300X",
+    "gfx950": "AMD Instinct MI350X",
+    "gfx90a": "AMD Instinct MI250X",
+}
+
+
 def _normalize_amd_gpu_name(raw_name: str) -> str:
     """Normalize the raw torch GPU name to a key in the GPU specs database.
 
     ``torch.cuda.get_device_name()`` may return strings like
-    ``"AMD Instinct MI300X OAM"`` or ``"Instinct MI300X"``.
-    We strip the OAM/PCIe suffix and ensure the ``"AMD Instinct"`` prefix.
+    ``"AMD Instinct MI300X OAM"``, ``"Instinct MI300X"``, or ``"gfx942"``.
+    We strip the OAM/PCIe suffix, map bare ISA names, and ensure the
+    ``"AMD Instinct"`` prefix.
 
     Args:
         raw_name: Raw name from ``torch.cuda.get_device_name()``.
@@ -95,6 +106,11 @@ def _normalize_amd_gpu_name(raw_name: str) -> str:
     for suffix in (" OAM", " PCIe", " SXM", " NVL"):
         if raw_name.endswith(suffix):
             raw_name = raw_name[: -len(suffix)].strip()
+
+    lowered = raw_name.lower()
+    for gfx, canonical in _GFX_TO_SPEC_NAME.items():
+        if gfx in lowered:
+            return canonical
 
     # Ensure "AMD Instinct" prefix
     if not raw_name.startswith("AMD "):
@@ -253,6 +269,8 @@ class ROCmWorkerRunner(WorkerRunner):
         high_reasoning_effort: bool,
         bottleneck_override: str | None,
         worker_kwargs: dict[str, Any],
+        gpu_ids: list[int] | None = None,
+        gpu_locks: dict[int, Any] | None = None,
     ) -> None:
         self.log_dir = log_dir
         self.logger = logger
@@ -262,6 +280,12 @@ class ROCmWorkerRunner(WorkerRunner):
         self.high_reasoning_effort = high_reasoning_effort
         self.bottleneck_override = bottleneck_override
         self.worker_kwargs = worker_kwargs
+        # Same multi-GPU contract as NvidiaWorkerRunner. HIP still honors
+        # CUDA_VISIBLE_DEVICES, so pinning works on the ROCm PyTorch build.
+        self.gpu_ids: list[int] = list(gpu_ids) if gpu_ids else [0]
+        self.gpu_locks: dict[int, Any] = (
+            dict(gpu_locks) if gpu_locks else {0: benchmark_lock}
+        )
 
     def run_workers(
         self,
@@ -273,12 +297,19 @@ class ROCmWorkerRunner(WorkerRunner):
         shared_history: list[dict],
         shared_reflexions: list[dict],
     ) -> list[dict[str, Any]]:
+        import queue as _queue_mod
+
         result_queue = mp.Queue()
         workers = []
 
         for i, candidate in enumerate(candidates):
             workdir = self.log_dir / "workers" / f"w{i}" / f"r{round_num}"
             workdir.mkdir(parents=True, exist_ok=True)
+
+            worker_model = candidate.get("openai_model") or self.openai_model
+            baseline_metrics = candidate.get("baseline_metrics")
+            gpu_id = self.gpu_ids[i % len(self.gpu_ids)]
+            gpu_lock = self.gpu_locks[gpu_id]
 
             args = (
                 i,
@@ -290,41 +321,63 @@ class ROCmWorkerRunner(WorkerRunner):
                 workdir,
                 workdir / "logs",
                 result_queue,
-                self.benchmark_lock,
-                self.profiling_semaphore,
+                gpu_lock,
+                gpu_lock,
                 pytorch_baseline,
                 candidate["bottleneck_id"],
-                self.openai_model,
+                worker_model,
                 self.high_reasoning_effort,
                 self.bottleneck_override,
                 self.worker_kwargs,
                 shared_history,
                 shared_reflexions,
+                baseline_metrics,
+                gpu_id,
             )
 
             p = mp.Process(target=_rocm_worker_process, args=args)
             p.start()
             workers.append(p)
 
-        worker_timeout = 1800  # 30 minutes (longer due to two rocprof passes)
+        # Drain the queue while joining. A full mp.Queue pipe blocks the
+        # worker's feeder thread, so join-then-drain deadlocks.
+        worker_timeout = 1800  # 30 minutes (rocprof is multi-pass)
         deadline = time.time() + worker_timeout
-        for w in workers:
-            remaining = max(0, deadline - time.time())
-            w.join(timeout=remaining)
-            if w.is_alive():
-                self.logger.warning(f"Worker {w.pid} timed out, terminating")
-                w.terminate()
-                w.join(timeout=5)
+        results: list[dict[str, Any]] = []
+        remaining_workers = list(workers)
+
+        while remaining_workers and time.time() < deadline:
+            while True:
+                try:
+                    results.append(result_queue.get_nowait())
+                except _queue_mod.Empty:
+                    break
+                except Exception:
+                    break
+            still_alive = []
+            for w in remaining_workers:
+                w.join(timeout=0.5)
                 if w.is_alive():
-                    self.logger.warning(f"Worker {w.pid} still alive, killing")
-                    w.kill()
-                    w.join(timeout=2)
+                    still_alive.append(w)
+                else:
+                    w.close()
+            remaining_workers = still_alive
+
+        for w in remaining_workers:
+            self.logger.warning(f"Worker {w.pid} timed out, terminating")
+            w.terminate()
+            w.join(timeout=5)
+            if w.is_alive():
+                self.logger.warning(f"Worker {w.pid} still alive, killing")
+                w.kill()
+                w.join(timeout=2)
             w.close()
 
-        results: list[dict[str, Any]] = []
-        while not result_queue.empty():
+        while True:
             try:
                 results.append(result_queue.get_nowait())
+            except _queue_mod.Empty:
+                break
             except Exception:
                 break
 
@@ -359,9 +412,19 @@ def _rocm_worker_process(
     worker_kwargs: dict,
     prior_history: list[dict],
     prior_reflexions: list[dict],
+    baseline_metrics: dict[str, Any] | None,
+    gpu_id: int,
 ) -> None:
     """Worker process function for AMD ROCm GPUs."""
+    import os
     import sys
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    print(
+        f"[worker {worker_id}] pinned to GPU {gpu_id} "
+        f"(CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})",
+        flush=True,
+    )
 
     kernel_agent_path = Path(__file__).parent.parent.parent
     if str(kernel_agent_path) not in sys.path:
@@ -375,7 +438,9 @@ def _rocm_worker_process(
 
         shutil.copy(problem_file, workdir / "problem.py")
 
-        worker_kwargs.pop("target_platform", None)
+        # Copy before popping so later workers still see the shared dict.
+        kwargs = dict(worker_kwargs)
+        kwargs.pop("target_platform", None)
         worker = OptimizationWorker(
             worker_id=worker_id,
             workdir=workdir,
@@ -390,7 +455,7 @@ def _rocm_worker_process(
             prior_history=prior_history,
             prior_reflexions=prior_reflexions,
             target_platform="rocm",
-            **worker_kwargs,
+            **kwargs,
         )
 
         success, best_kernel, metrics = worker.optimize_kernel(
@@ -399,6 +464,7 @@ def _rocm_worker_process(
             test_code=test_code,
             known_kernel_time=known_time,
             max_opt_rounds=1,
+            baseline_metrics=baseline_metrics,
         )
 
         result_queue.put(
@@ -408,6 +474,8 @@ def _rocm_worker_process(
                 "kernel_code": best_kernel,
                 "time_ms": metrics.get("best_time_ms", float("inf")),
                 "parent_id": parent_id,
+                "openai_model": openai_model,
+                "ptx_hash": metrics.get("best_ptx_hash"),
                 "attempt": metrics.get("last_attempt"),
                 "reflexion": metrics.get("last_reflexion"),
             }
@@ -418,6 +486,7 @@ def _rocm_worker_process(
             {
                 "success": False,
                 "worker_id": worker_id,
+                "openai_model": openai_model,
                 "error": str(e),
                 "traceback": traceback.format_exc(),
             }
@@ -466,19 +535,26 @@ class ROCmAcceleratorSpecsProvider(AcceleratorSpecsProvider):
 class ROCmKernelProfilerWrapper(KernelProfilerBase):
     """Wraps :class:`ROCmKernelProfiler` with lazy construction."""
 
+    # Orchestrator checks this attribute. The class name is the wrapper, not
+    # ROCmKernelProfiler, so a __class__.__name__ comparison misses the registry path.
+    platform = "rocm"
+
     def __init__(
         self,
         logger: logging.Logger | None = None,
         log_dir: Path | None = None,
         artifacts_dir: Path | None = None,
         rocprof_bin_path: str | None = None,
+        ncu_bin_path: str | None = None,
         rocprof_timeout_seconds: int | None = None,
         profiling_semaphore: Any | None = None,
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
         self._log_dir = Path(log_dir) if log_dir else Path(".")
         self._artifacts_dir = Path(artifacts_dir) if artifacts_dir else None
-        self._rocprof_bin_path = rocprof_bin_path
+        # OptimizationWorker always forwards ncu_bin_path. On ROCm that slot
+        # is the profiler binary, which is rocprof rather than ncu.
+        self._rocprof_bin_path = rocprof_bin_path or ncu_bin_path
         self._rocprof_timeout_seconds = rocprof_timeout_seconds
         self._profiling_semaphore = profiling_semaphore
         self._delegate: Any | None = None
@@ -544,8 +620,16 @@ class ROCmRooflineAnalyzerWrapper(RooflineAnalyzerBase):
             self._delegate = ROCmRooflineAnalyzer(**kwargs)
         return self._delegate
 
-    def analyze(self, rocm_metrics: dict[str, Any]) -> Any:
-        return self._get_delegate().analyze(rocm_metrics)
+    def analyze(
+        self,
+        ncu_metrics: dict[str, Any] | None = None,
+        rocm_metrics: dict[str, Any] | None = None,
+    ) -> Any:
+        # Callers shared with NVIDIA pass ``ncu_metrics=``. ``rocm_metrics``
+        # remains accepted for direct ROCm call sites.
+        return self._get_delegate().analyze(
+            ncu_metrics=ncu_metrics, rocm_metrics=rocm_metrics
+        )
 
     def should_stop(self, result: Any) -> tuple[bool, str]:
         return self._get_delegate().should_stop(result)
@@ -568,11 +652,13 @@ class ROCmBottleneckAnalyzer(BottleneckAnalyzerBase):
         openai_model: str = "gpt-5",
         gpu_name: str | None = None,
         roofline_config: Any | None = None,
+        num_bottlenecks: int = 1,
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
         self._log_dir = Path(log_dir) if log_dir else None
         self._openai_model = openai_model
         self._gpu_name = gpu_name
+        self._num_bottlenecks = max(1, int(num_bottlenecks))
         self._delegate: Any | None = None
         self.roofline = ROCmRooflineAnalyzerWrapper(
             logger=self._logger, roofline_config=roofline_config
@@ -605,6 +691,7 @@ class ROCmBottleneckAnalyzer(BottleneckAnalyzerBase):
                 gpu_specs=gpu_specs,
                 logs_dir=self._log_dir,
                 logger=self._logger,
+                num_bottlenecks=self._num_bottlenecks,
             )
         return self._delegate
 

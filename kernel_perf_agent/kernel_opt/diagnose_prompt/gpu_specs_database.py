@@ -225,7 +225,7 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "l1_cache_kb": 32,
         "l2_cache_mb": 192,
         "memory_gb": 128,
-        "memory_type": "HBM3",
+        "memory_type": "HBM3 unified",
         "form_factor": "OAM",
         "tdp_w": 550,
     },
@@ -250,6 +250,7 @@ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
         "memory_type": "HBM3E",
         "form_factor": "OAM",
         "tdp_w": 1000,
+        "specs_confidence": "estimated",
     },
     # AMD Instinct MI250X (CDNA2 / gfx90a)
     "AMD Instinct MI250X": {

@@ -145,3 +145,22 @@ def get_platform(name: str) -> PlatformConfig:
 def get_platform_choices() -> list[str]:
     """Get list of available platform names for CLI choices."""
     return sorted(PLATFORMS.keys())
+
+
+def resolve_test_timeout_s(
+    test_timeout_s: int | None,
+    target_platform: str | PlatformConfig | None,
+) -> int:
+    """Pick a test timeout when the caller did not set one.
+
+    CUDA and XPU keep the historical 30s default. ROCm Triton JIT on a cold
+    cache often exceeds that, so an omitted timeout is 300s on ROCm only.
+    An explicit value is returned unchanged on every platform.
+    """
+    if test_timeout_s is not None:
+        return test_timeout_s
+    if isinstance(target_platform, PlatformConfig):
+        name = target_platform.name
+    else:
+        name = target_platform or "cuda"
+    return 300 if name == "rocm" else 30

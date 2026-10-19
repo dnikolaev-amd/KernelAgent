@@ -59,8 +59,8 @@ from utils.config_injectable import config_injectable
 # Local imports (available inside repo)
 from triton_kernel_agent import TritonKernelAgent
 from triton_kernel_agent.platform_config import (
-    get_platform_choices,
     get_platform,
+    get_platform_choices,
 )
 from utils.providers.models import get_model_provider, is_model_available
 
@@ -349,7 +349,7 @@ class AutoKernelRouter:
         ignore_router_config: bool = False,
         use_router_cache: bool = True,
         no_cusolver: bool = False,
-        test_timeout_s: int = 300,
+        test_timeout_s: int = 30,
         test_code: str | None = None,
     ) -> None:
         self.ka_model = ka_model

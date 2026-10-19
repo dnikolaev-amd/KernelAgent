@@ -40,7 +40,10 @@ from pathlib import Path
 from .subgraph_extractor import extract_subgraphs_to_json
 from .dispatch_kernel_agent import run as dispatch_run
 from .compose_end_to_end import compose
-from triton_kernel_agent.platform_config import get_platform_choices
+from triton_kernel_agent.platform_config import (
+    get_platform_choices,
+    resolve_test_timeout_s,
+)
 
 
 def run_pipeline(
@@ -57,8 +60,9 @@ def run_pipeline(
     verify: bool = True,
     compose_max_iters: int = 5,
     target_platform: str = "cuda",
-    test_timeout_s: int = 300,
+    test_timeout_s: int | None = None,
 ) -> dict:
+    test_timeout_s = resolve_test_timeout_s(test_timeout_s, target_platform)
     # Select default KernelAgent model if not provided: prefer GPT-5 for Level 2/3
     if dispatch_model is None:
         pp = str(problem_path)

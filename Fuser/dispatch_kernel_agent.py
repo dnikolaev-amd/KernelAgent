@@ -50,9 +50,10 @@ except Exception:  # pragma: no cover - import-time dependency
     TritonKernelAgent = None  # type: ignore
 
 from triton_kernel_agent.platform_config import (
+    PlatformConfig,
     get_platform,
     get_platform_choices,
-    PlatformConfig,
+    resolve_test_timeout_s,
 )
 
 
@@ -334,13 +335,15 @@ def run(
     target_platform: str = "cuda",
     max_iters: int = 10,
     no_cusolver: bool = False,
-    test_timeout_s: int = 300,
+    test_timeout_s: int | None = None,
 ) -> Path:
     """Dispatch subgraphs to KernelAgent with optional parallelism.
 
     jobs controls the number of concurrent subgraph generations. Default=1
     preserves previous behavior and avoids GPU/LLM contention.
     """
+    test_timeout_s = resolve_test_timeout_s(test_timeout_s, target_platform)
+
     if TritonKernelAgent is None:
         raise SystemExit(
             "TritonKernelAgent not available. Ensure the package is importable."

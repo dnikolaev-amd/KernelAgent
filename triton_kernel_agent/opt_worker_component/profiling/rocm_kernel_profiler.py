@@ -80,7 +80,12 @@ class ROCmKernelProfiler:
     Drop-in replacement for
     :class:`triton_kernel_agent.opt_worker_component.profiling.kernel_profiler.KernelProfiler`
     for the ROCm/HIP platform.
+
+    ``platform`` is how the orchestrator recognizes this backend when the
+    object is injected directly instead of through ``ROCmKernelProfilerWrapper``.
     """
+
+    platform = "rocm"
 
     def __init__(
         self,

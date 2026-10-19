@@ -145,10 +145,26 @@ def _format_gpu_specs(gpu_specs: dict[str, Any]) -> str:
     """Format GPU specifications using metric_schema definitions."""
     lines = []
 
+    arch = str(gpu_specs.get("architecture", ""))
+    amd = arch.startswith("CDNA") or "cu_count" in gpu_specs
+    label_overrides = (
+        {
+            "SM Count": "CU Count",
+            "Max Threads per SM": "Max Threads per CU",
+            "L1 Cache per SM": "L1 Cache per CU",
+        }
+        if amd
+        else {}
+    )
     for label, key, unit in GPU_SPEC_FIELDS:
         value = gpu_specs.get(key)
         if value is not None:
-            lines.append(f"- {label}: {_fmt_value(value)}{unit}")
+            shown = label_overrides.get(label, label)
+            lines.append(f"- {shown}: {_fmt_value(value)}{unit}")
+
+    confidence = gpu_specs.get("specs_confidence")
+    if confidence:
+        lines.append(f"- Specs confidence: {confidence}")
 
     for label, size_key, type_key, unit in GPU_MEMORY_FIELDS:
         size = gpu_specs.get(size_key)
@@ -160,8 +176,18 @@ def _format_gpu_specs(gpu_specs: dict[str, Any]) -> str:
     return "\n".join(lines) if lines else "N/A"
 
 
+_ROCM_COUNTER_FIELDS = [
+    ("Heuristic compute SOL (instruction mix)", "compute_sol_pct", "%"),
+    ("Heuristic memory SOL (instruction mix)", "memory_sol_pct", "%"),
+    ("VALU instruction share", "valu_utilization_pct", "%"),
+    ("VMEM instruction share", "memory_bound_pct", "%"),
+    ("L2 hit rate", "tcc_cache_hit_rate_pct", "%"),
+    ("Kernel duration", "duration_ms", " ms"),
+]
+
+
 def _format_ncu_metrics(ncu_metrics: dict[str, Any]) -> str:
-    """Format NCU metrics grouped by section using metric_schema definitions."""
+    """Format profiler metrics grouped by section using metric_schema definitions."""
     lines = []
 
     for section_name, metric_defs in NCU_METRIC_SECTIONS.items():
@@ -175,7 +201,18 @@ def _format_ncu_metrics(ncu_metrics: dict[str, Any]) -> str:
             lines.append(f"### {section_name}")
             lines.extend(section_lines)
 
+    rocm_lines = []
+    for label, key, unit in _ROCM_COUNTER_FIELDS:
+        value = ncu_metrics.get(key)
+        if value is not None:
+            rocm_lines.append(f"  - {label}: {_fmt_value(value)}{unit}")
+    if rocm_lines:
+        lines.append("### ROCm Counters")
+        lines.extend(rocm_lines)
+
     schema_keys = {key for _, key, _ in sum(NCU_METRIC_SECTIONS.values(), [])}
+    schema_keys.update(key for _, key, _ in _ROCM_COUNTER_FIELDS)
+    schema_keys.add("_raw_counters")
     other_keys = sorted(set(ncu_metrics.keys()) - schema_keys)
     if other_keys:
         lines.append("### Other Metrics")

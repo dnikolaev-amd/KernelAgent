@@ -170,6 +170,23 @@ class Reflexion:
         return cls(**{k: v for k, v in d.items() if k in valid_keys})
 
 
+def profiler_is_rocm(profiler: Any) -> bool:
+    """True when *profiler* is the ROCm backend or its registry wrapper."""
+    if getattr(profiler, "platform", None) == "rocm":
+        return True
+    delegate = getattr(profiler, "_delegate", None)
+    return getattr(delegate, "platform", None) == "rocm"
+
+
+def should_disable_profiling(profiler: Any, profiling_available: bool) -> bool:
+    """Whether later rounds should stop calling the profiler.
+
+    ROCm rocprof failures switch the session to synthetic analysis.
+    A CUDA/NCU failure does not: the next round profiles again.
+    """
+    return profiler_is_rocm(profiler) and not profiling_available
+
+
 def _get_triton_kernel_metrics(ncu_metrics: dict[str, Any]) -> dict[str, Any]:
     """
     Extract metrics for the Triton kernel, filtering out PyTorch kernels.
@@ -177,19 +194,26 @@ def _get_triton_kernel_metrics(ncu_metrics: dict[str, Any]) -> dict[str, Any]:
     NCU profiles all CUDA kernels including PyTorch internals (at::*).
     This function finds the actual Triton kernel metrics.
 
-    Note: This helper is NCU/CUDA-specific. On the ROCm path,
-    ``profiler_results.metrics`` is already a flat dict and should be
-    passed directly to ``ROCmRooflineAnalyzer.analyze`` without going
-    through this function.
+    rocprof returns one flat counter dict. Passing that through
+    ``next(iter(values()))`` yields a scalar, so flat dicts are returned
+    as-is (minus the raw counter dump).
 
     Args:
-        ncu_metrics: Dict keyed by kernel name with metric dicts as values
+        ncu_metrics: NCU map of kernel name to metric dict, or a flat
+            rocprof counter dict.
 
     Returns:
         Flat metrics dict for the Triton kernel, or first non-PyTorch kernel
     """
     if not ncu_metrics:
         return {}
+
+    # NCU maps kernel name -> metric dict, so every value is a dict.
+    # rocprof is a flat counter dict plus an optional ``_raw_counters`` blob.
+    if not all(isinstance(value, dict) for value in ncu_metrics.values()):
+        return {
+            key: value for key, value in ncu_metrics.items() if key != "_raw_counters"
+        }
 
     # Filter out PyTorch kernels (they start with "at::" or "void at::")
     triton_kernels = {
@@ -378,7 +402,9 @@ class OptimizationOrchestrator:
 
         # Two-kernel tracking: track best-by-runtime and best-by-SOL independently
         # This prevents mixing metrics from different kernels
-        profiling_globally_available = baseline_sol > 0.0
+        # Start enabled on every platform. A missing baseline SOL used to
+        # force synthetic mode, which also disabled NCU on CUDA.
+        profiling_globally_available = True
         best_runtime_kernel = kernel_code
         best_runtime_time = best_time
         best_runtime_sol = baseline_sol
@@ -402,7 +428,7 @@ class OptimizationOrchestrator:
                     self._profile_and_analyze(current_kernel, problem_file, round_num)
                 )
                 profiling_available = bool(ncu_metrics)
-                if not profiling_available:
+                if should_disable_profiling(self.profiler, profiling_available):
                     profiling_globally_available = False
             else:
                 self.logger.warning(
@@ -837,11 +863,7 @@ class OptimizationOrchestrator:
             ncu_metrics = cached["ncu_metrics"]
             self._pending_baseline_metrics = None  # consume once
         else:
-            profiler_name = (
-                "rocprof"
-                if self.profiler.__class__.__name__ == "ROCmKernelProfiler"
-                else "NCU"
-            )
+            profiler_name = "rocprof" if profiler_is_rocm(self.profiler) else "NCU"
             self.logger.info(
                 f"[{round_num}] Profiling current kernel with {profiler_name}..."
             )
@@ -853,7 +875,7 @@ class OptimizationOrchestrator:
             )
 
             if profiler_results is None:
-                if self.profiler.__class__.__name__ == "ROCmKernelProfiler":
+                if profiler_is_rocm(self.profiler):
                     self.logger.warning(
                         f"[{round_num}] ROCm profiling unavailable; using synthetic fallback bottleneck analysis"
                     )
@@ -898,7 +920,7 @@ class OptimizationOrchestrator:
             ncu_metrics = profiler_results.metrics
 
             if not ncu_metrics:
-                if self.profiler.__class__.__name__ == "ROCmKernelProfiler":
+                if profiler_is_rocm(self.profiler):
                     self.logger.warning(
                         f"[{round_num}] ROCm profiling returned no metrics; using synthetic fallback bottleneck analysis"
                     )
@@ -1004,14 +1026,6 @@ class OptimizationOrchestrator:
             Dict with efficiency_pct, roofline_result, ncu_metrics, or None if profiling fails
         """
         try:
-            # On ROCm, skip SOL profiling entirely when the profiler backend is rocprof.
-            # This avoids re-entering the same fragile profiling path after fallback.
-            if self.profiler.__class__.__name__ == "ROCmKernelProfiler":
-                self.logger.info(
-                    f"[{round_num}] Skipping SOL profiling on ROCm to avoid re-entering rocprof after fallback"
-                )
-                return None
-
             # Write kernel to temp file for profiling
             kernel_file = self.artifact_dir / f"kernel_round_{round_num}_sol.py"
             kernel_file.write_text(kernel_code)

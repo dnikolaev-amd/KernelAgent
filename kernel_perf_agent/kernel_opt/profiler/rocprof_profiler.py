@@ -448,7 +448,8 @@ def _merge_rocprof_outputs(
         100.0 * metrics["tcc_hit"] / tcc_total if tcc_total > 0 else 0.0
     )
 
-    # Derived: VALU utilization (fraction of cycles spent on vector ALU)
+    # Derived: VALU share of counted shader instructions, not cycles and
+    # not percent of peak FLOPs.
     total_insts = (
         metrics["sq_insts_valu"]
         + metrics["sq_insts_salu"]
@@ -470,9 +471,9 @@ def _merge_rocprof_outputs(
     # These are heuristic approximations since rocprof does not provide
     # "Speed of Light" metrics directly (unlike NCU).
     #
-    # Compute SOL: use VALU utilization as a proxy for compute utilization.
-    # Memory SOL: use cache miss rate × memory traffic as a bandwidth proxy.
-    # Both are normalized to [0, 100].
+    # Compute SOL: VALU instruction share, used as a proxy for compute mix.
+    # Memory SOL: VMEM instruction share. L2-miss amplification is applied
+    # later by ROCmRooflineAnalyzer. Neither value is percent of peak.
     metrics["compute_sol_pct"] = min(metrics["valu_utilization_pct"], 100.0)
     metrics["memory_sol_pct"] = min(metrics["memory_bound_pct"], 100.0)
 

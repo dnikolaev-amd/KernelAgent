@@ -48,7 +48,10 @@ class ROCmRooflineConfig:
     """Configuration for ROCm roofline analysis."""
 
     threshold_pct: float = 85.0  # Lower than NCU (heuristic, not exact SOL)
-    early_stop: bool = True
+    # Instruction-mix ratios are not percent-of-peak. Leaving early stop on
+    # would halt optimization when VALU instructions dominate, even if the
+    # kernel is far from the HBM or FLOP roof.
+    early_stop: bool = False
     convergence_rounds: int = 5
     min_improvement_pct: float = 0.1
     underutilized_threshold: float = 40.0  # Both SOL < this → underutilized
@@ -104,16 +107,32 @@ class ROCmRooflineAnalyzer:
     # Core analysis
     # ------------------------------------------------------------------
 
-    def analyze(self, rocm_metrics: dict[str, Any]) -> ROCmRooflineResult:
+    def analyze(
+        self,
+        ncu_metrics: dict[str, Any] | None = None,
+        rocm_metrics: dict[str, Any] | None = None,
+    ) -> ROCmRooflineResult:
         """Analyse rocprof metrics and return a roofline result.
 
+        The first parameter is named ``ncu_metrics`` so this matches
+        ``RooflineAnalyzerBase.analyze`` and NVIDIA call sites that pass
+        ``ncu_metrics=``. ``rocm_metrics`` is the same dict under the
+        ROCm name.
+
         Args:
-            rocm_metrics: Metrics dict from
-                :func:`kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.load_rocm_metrics`.
+            ncu_metrics: Flat metrics dict from rocprof (shared call-site name).
+            rocm_metrics: Same dict, accepted when callers use the ROCm name.
 
         Returns:
             :class:`ROCmRooflineResult` with heuristic SOL estimates.
         """
+        metrics = ncu_metrics if ncu_metrics is not None else rocm_metrics
+        if not isinstance(metrics, dict):
+            raise TypeError(
+                "ROCmRooflineAnalyzer.analyze expected a metrics dict, "
+                f"got {type(metrics).__name__}"
+            )
+        rocm_metrics = metrics
         warnings: list[str] = []
 
         # Retrieve pre-computed heuristic SOL values (set by rocprof_profiler)
