@@ -306,17 +306,25 @@ class OptimizationManager:
             impl_name = config.get(key)
             if impl_name and registry.has(key, impl_name):
                 try:
+                    baseline_kwargs: dict[str, Any] = {
+                        "logger": self.logger,
+                        "log_dir": self.log_dir,
+                        "artifacts_dir": self.log_dir / "baseline_profiles",
+                        "profiling_semaphore": self.profiling_semaphore,
+                    }
+                    if self.worker_kwargs.get("ncu_bin_path"):
+                        baseline_kwargs["ncu_bin_path"] = self.worker_kwargs[
+                            "ncu_bin_path"
+                        ]
+                    # Same bag the workers unpack, so a YAML rocprof_bin_path
+                    # applies to the cached baseline profile too.
+                    baseline_kwargs.update(
+                        self.worker_kwargs.get("platform_kwargs") or {}
+                    )
                     setattr(
                         self,
                         setter_attr,
-                        registry.create(
-                            key,
-                            impl_name,
-                            logger=self.logger,
-                            log_dir=self.log_dir,
-                            artifacts_dir=self.log_dir / "baseline_profiles",
-                            profiling_semaphore=self.profiling_semaphore,
-                        ),
+                        registry.create(key, impl_name, **baseline_kwargs),
                     )
                 except Exception as e:
                     self.logger.warning(

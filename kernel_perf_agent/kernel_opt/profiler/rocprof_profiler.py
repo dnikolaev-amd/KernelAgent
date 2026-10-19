@@ -37,7 +37,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Hardware counter sets collected via rocprof -i <input_file>
@@ -156,8 +156,8 @@ def profile_triton_kernel_rocm(
     benchmark_script: Path,
     workdir: Path,
     out_prefix: str = "rocprof_output",
-    python_executable: Optional[str] = None,
-    rocprof_bin: Optional[str] = None,
+    python_executable: str | None = None,
+    rocprof_bin: str | None = None,
     timeout: int = 360,
 ) -> Path:
     """Profile a Triton kernel using rocprof.
@@ -286,8 +286,12 @@ def _run_rocprof_pmc(
     env: dict,
     timeout: int,
 ) -> None:
-    """Run rocprof -i <input_file> to collect PMC counters."""
-    # rocprofv3 uses --pmc or -i for counter collection
+    """Run rocprof -i <input_file> to collect PMC counters.
+
+    rocprof v2 and rocprofv3 both accept ``-i`` for the PMC input file, so
+    this pass does not branch on the binary. The stats pass does: rocprofv3
+    rejects ``--stats`` unless ``--kernel-trace`` is also set.
+    """
     cmd = [
         rocprof_bin,
         "-i",
@@ -320,14 +324,14 @@ def _run_rocprof_pmc(
 # ---------------------------------------------------------------------------
 
 
-def _parse_stats_csv(csv_path: Path) -> Dict[str, Any]:
+def _parse_stats_csv(csv_path: Path) -> dict[str, Any]:
     """Parse rocprof --stats CSV to extract kernel durations."""
     if not csv_path.exists():
         return {}
 
     import csv
 
-    rows: List[Dict[str, str]] = []
+    rows: list[dict[str, str]] = []
     try:
         with csv_path.open(newline="") as f:
             reader = csv.DictReader(f)
@@ -341,7 +345,7 @@ def _parse_stats_csv(csv_path: Path) -> Dict[str, Any]:
     # rocprof stats CSV columns: Name, Calls, TotalDurationNs, AverageNs, ...
     # Pick the last kernel invocation (after warmup)
     row = rows[-1]
-    result: Dict[str, Any] = {}
+    result: dict[str, Any] = {}
     for key in ("Name", "Calls", "TotalDurationNs", "AverageNs", "Percentage"):
         if key in row:
             try:
@@ -356,14 +360,14 @@ def _parse_stats_csv(csv_path: Path) -> Dict[str, Any]:
     return result
 
 
-def _parse_pmc_csv(csv_path: Path) -> Dict[str, Any]:
+def _parse_pmc_csv(csv_path: Path) -> dict[str, Any]:
     """Parse rocprof PMC CSV to extract hardware counter values."""
     if not csv_path.exists():
         return {}
 
     import csv
 
-    rows: List[Dict[str, str]] = []
+    rows: list[dict[str, str]] = []
     try:
         with csv_path.open(newline="") as f:
             reader = csv.DictReader(f)
@@ -378,7 +382,7 @@ def _parse_pmc_csv(csv_path: Path) -> Dict[str, Any]:
     # queue-index, pid, tid, grd, wgr, lds, scr, arch_vgpr, accum_vgpr,
     # sgpr, wave_size, sig, obj, <counter1>, <counter2>, ...
     # Aggregate all rows by summing numeric counter columns
-    aggregated: Dict[str, float] = {}
+    aggregated: dict[str, float] = {}
     counter_cols = [
         k
         for k in rows[0].keys()
@@ -409,7 +413,7 @@ def _parse_pmc_csv(csv_path: Path) -> Dict[str, Any]:
 def _merge_rocprof_outputs(
     stats_csv: Path,
     pmc_csv: Path,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Merge stats and PMC outputs into a normalized metrics dictionary.
 
     The returned dict is compatible with the rest of the KernelAgent pipeline
@@ -419,12 +423,12 @@ def _merge_rocprof_outputs(
     pmc = _parse_pmc_csv(pmc_csv)
 
     # Raw counters (lower-cased for consistency)
-    raw: Dict[str, Any] = {}
+    raw: dict[str, Any] = {}
     for k, v in pmc.items():
         raw[k.lower()] = v
 
     # Normalize to our metric keys
-    metrics: Dict[str, Any] = {
+    metrics: dict[str, Any] = {
         "sq_waves": raw.get("sq_waves", 0.0),
         "sq_insts_valu": raw.get("sq_insts_valu", 0.0),
         "sq_insts_salu": raw.get("sq_insts_salu", 0.0),
@@ -488,7 +492,7 @@ def _merge_rocprof_outputs(
 # ---------------------------------------------------------------------------
 
 
-def load_rocm_metrics(json_path: Path) -> Dict[str, Any]:
+def load_rocm_metrics(json_path: Path) -> dict[str, Any]:
     """Load rocprof metrics from a JSON file produced by :func:`profile_triton_kernel_rocm`.
 
     Args:
@@ -505,7 +509,7 @@ def load_rocm_metrics(json_path: Path) -> Dict[str, Any]:
     return json.loads(json_path.read_text())
 
 
-def metrics_to_prompt_rocm(metrics: Dict[str, Any]) -> str:
+def metrics_to_prompt_rocm(metrics: dict[str, Any]) -> str:
     """Convert ROCm metrics dict to a JSON string for LLM prompts.
 
     Args:

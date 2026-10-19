@@ -160,6 +160,47 @@ def test_bottleneck_analyzer_accepts_num_bottlenecks():
     assert "num_bottlenecks" in params
 
 
+def test_yaml_platform_kwargs_select_rocprof_binary(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "triton_kernel_agent.opt_worker.get_model_provider",
+        lambda *_args, **_kwargs: object(),
+    )
+    cfg = tmp_path / "amd.yaml"
+    cfg.write_text(
+        """\
+strategy: greedy
+num_workers: 1
+gpu_name: AMD Instinct MI300X
+target_platform: rocm
+platform:
+  verifier: noop
+  benchmarker: noop
+  worker_runner: noop
+  profiler: rocm
+  specs_provider: rocm
+platform_kwargs:
+  rocprof_bin_path: /opt/rocm/bin/rocprofv3
+"""
+    )
+    from triton_kernel_agent.opt_manager import OptimizationManager
+    from triton_kernel_agent.opt_worker import OptimizationWorker
+
+    manager = OptimizationManager(
+        config=str(cfg),
+        log_dir=tmp_path / "logs",
+        gpu_ids=[0],
+    )
+    assert manager._mgr_profiler._rocprof_bin_path == "/opt/rocm/bin/rocprofv3"
+
+    worker = OptimizationWorker(
+        worker_id=0,
+        workdir=tmp_path / "worker",
+        log_dir=tmp_path / "worker-logs",
+        **manager.worker_kwargs,
+    )
+    assert worker.profiler._rocprof_bin_path == "/opt/rocm/bin/rocprofv3"
+
+
 def test_worker_runner_matches_multi_gpu_contract():
     params = inspect.signature(ROCmWorkerRunner.__init__).parameters
     assert "gpu_ids" in params
