@@ -79,6 +79,18 @@ _PMC_PASS4 = [
     "WRITE_SIZE",  # bytes written to memory (in KB, vendor metric)
 ]
 
+# rocprofv3 reruns the app once per pmc group and overwrites the CSV, so
+# each group is collected on its own. gfx942 names the EA counters
+# TCC_EA0_* and drops a whole group when any name in it is missing.
+_PMC_V3_PASSES = [
+    _PMC_PASS1,
+    ["TCC_HIT_sum", "TCC_MISS_sum"],
+    ["TCC_EA0_RDREQ_sum"],
+    ["TCC_EA0_WRREQ_sum"],
+    _PMC_PASS3,
+    _PMC_PASS4,
+]
+
 # Derived metric keys returned in the normalized metrics dict
 ROCM_METRIC_KEYS = [
     "sq_waves",
@@ -255,7 +267,9 @@ def _run_rocprof_stats(
     is_v3 = "rocprofv3" in rocprof_bin
     cmd = [rocprof_bin]
     if is_v3:
-        cmd.extend(["--kernel-trace", "--stats", "-o", str(out_csv)])
+        # Default rocprofv3 output is a rocpd database. -f csv writes
+        # {prefix}_kernel_stats.csv, which _parse_stats_csv reads.
+        cmd.extend(["--kernel-trace", "--stats", "-f", "csv", "-o", str(out_csv)])
     else:
         cmd.extend(["--stats", "-o", str(out_csv)])
     cmd.extend(["--", python_executable, str(benchmark_script)])
@@ -288,10 +302,21 @@ def _run_rocprof_pmc(
 ) -> None:
     """Run rocprof -i <input_file> to collect PMC counters.
 
-    rocprof v2 and rocprofv3 both accept ``-i`` for the PMC input file, so
-    this pass does not branch on the binary. The stats pass does: rocprofv3
-    rejects ``--stats`` unless ``--kernel-trace`` is also set.
+    rocprof v2 collects every ``pmc:`` line in one invocation. rocprofv3
+    overwrites its CSV on each job, so those groups are run separately.
     """
+    if "rocprofv3" in rocprof_bin:
+        _run_rocprofv3_pmc_passes(
+            rocprof_bin=rocprof_bin,
+            benchmark_script=benchmark_script,
+            workdir=workdir,
+            out_csv=out_csv,
+            python_executable=python_executable,
+            env=env,
+            timeout=timeout,
+        )
+        return
+
     cmd = [
         rocprof_bin,
         "-i",
@@ -319,13 +344,99 @@ def _run_rocprof_pmc(
     print("[rocprof] PMC pass completed")
 
 
+def _run_rocprofv3_pmc_passes(
+    rocprof_bin: str,
+    benchmark_script: Path,
+    workdir: Path,
+    out_csv: Path,
+    python_executable: str,
+    env: dict,
+    timeout: int,
+) -> None:
+    """Collect each rocprofv3 counter group into its own CSV, then merge.
+
+    A multi-job input rewrites ``{prefix}_counter_collection.csv`` on every
+    pass, so only the last group would survive.
+    """
+    import csv
+
+    combined_header: list[str] | None = None
+    combined_rows: list[list[str]] = []
+    for index, counters in enumerate(_PMC_V3_PASSES):
+        pass_input = workdir / f"rocprof_input_pass{index}.txt"
+        pass_input.write_text("pmc: " + " ".join(counters) + "\n")
+        pass_out = workdir / f"{out_csv.name}_pass{index}"
+        cmd = [
+            rocprof_bin,
+            "-i",
+            str(pass_input),
+            "-f",
+            "csv",
+            "-o",
+            str(pass_out),
+            "--",
+            python_executable,
+            str(benchmark_script),
+        ]
+        print(f"[rocprof] Running PMC pass {index + 1}: {' '.join(counters)}")
+        result = subprocess.run(
+            cmd,
+            cwd=str(workdir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"rocprof PMC pass {index + 1} failed (rc={result.returncode}):\n"
+                f"{(result.stderr or result.stdout)[:500]}"
+            )
+        csv_path = Path(str(pass_out) + "_counter_collection.csv")
+        if not csv_path.exists():
+            continue
+        with csv_path.open(newline="") as handle:
+            rows = list(csv.reader(handle))
+        if len(rows) < 2:
+            continue
+        if combined_header is None:
+            combined_header = rows[0]
+        combined_rows.extend(rows[1:])
+
+    if combined_header is None:
+        raise RuntimeError("rocprofv3 PMC produced no counter rows")
+
+    dest = Path(str(out_csv) + "_counter_collection.csv")
+    with dest.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(combined_header)
+        writer.writerows(combined_rows)
+    print("[rocprof] PMC pass completed")
+
+
 # ---------------------------------------------------------------------------
 # Output parsing
 # ---------------------------------------------------------------------------
 
 
+def _resolve_collected_csv(csv_path: Path, suffix: str) -> Path:
+    """Return the CSV rocprof actually wrote.
+
+    rocprof v2 writes the ``-o`` path. rocprofv3 ``-f csv`` appends a suffix
+    to that path, for example ``stats.csv_kernel_stats.csv``.
+    """
+    if csv_path.exists():
+        return csv_path
+    sibling = csv_path.with_name(csv_path.name + suffix)
+    if sibling.exists():
+        return sibling
+    return csv_path
+
+
 def _parse_stats_csv(csv_path: Path) -> dict[str, Any]:
     """Parse rocprof --stats CSV to extract kernel durations."""
+    csv_path = _resolve_collected_csv(csv_path, "_kernel_stats.csv")
     if not csv_path.exists():
         return {}
 
@@ -343,8 +454,20 @@ def _parse_stats_csv(csv_path: Path) -> dict[str, Any]:
         return {}
 
     # rocprof stats CSV columns: Name, Calls, TotalDurationNs, AverageNs, ...
-    # Pick the last kernel invocation (after warmup)
+    # One row per kernel name. Use the kernel with the most total time.
     row = rows[-1]
+    best_total = -1.0
+    for candidate in rows:
+        raw_total = candidate.get("TotalDurationNs")
+        if raw_total is None:
+            continue
+        try:
+            total = float(raw_total)
+        except (ValueError, TypeError):
+            continue
+        if total >= best_total:
+            best_total = total
+            row = candidate
     result: dict[str, Any] = {}
     for key in ("Name", "Calls", "TotalDurationNs", "AverageNs", "Percentage"):
         if key in row:
@@ -362,6 +485,7 @@ def _parse_stats_csv(csv_path: Path) -> dict[str, Any]:
 
 def _parse_pmc_csv(csv_path: Path) -> dict[str, Any]:
     """Parse rocprof PMC CSV to extract hardware counter values."""
+    csv_path = _resolve_collected_csv(csv_path, "_counter_collection.csv")
     if not csv_path.exists():
         return {}
 
@@ -378,7 +502,22 @@ def _parse_pmc_csv(csv_path: Path) -> dict[str, Any]:
     if not rows:
         return {}
 
-    # rocprof PMC CSV columns: Index, KernelName, gpu-id, queue-id,
+    # rocprofv3 writes one row per counter: Counter_Name, Counter_Value.
+    if "Counter_Name" in rows[0] and "Counter_Value" in rows[0]:
+        aggregated: dict[str, float] = {}
+        for row in rows:
+            name = (row.get("Counter_Name") or "").strip()
+            if not name:
+                continue
+            try:
+                aggregated[name] = aggregated.get(name, 0.0) + float(
+                    row["Counter_Value"]
+                )
+            except (ValueError, TypeError, KeyError):
+                pass
+        return aggregated
+
+    # rocprof v2 PMC CSV columns: Index, KernelName, gpu-id, queue-id,
     # queue-index, pid, tid, grd, wgr, lds, scr, arch_vgpr, accum_vgpr,
     # sgpr, wave_size, sig, obj, <counter1>, <counter2>, ...
     # Aggregate all rows by summing numeric counter columns
@@ -438,8 +577,8 @@ def _merge_rocprof_outputs(
         "sq_wait_inst_any": raw.get("sq_wait_inst_any", 0.0),
         "tcc_hit": raw.get("tcc_hit_sum", 0.0),
         "tcc_miss": raw.get("tcc_miss_sum", 0.0),
-        "tcc_ea_rdreq": raw.get("tcc_ea_rdreq_sum", 0.0),
-        "tcc_ea_wrreq": raw.get("tcc_ea_wrreq_sum", 0.0),
+        "tcc_ea_rdreq": raw.get("tcc_ea_rdreq_sum", raw.get("tcc_ea0_rdreq_sum", 0.0)),
+        "tcc_ea_wrreq": raw.get("tcc_ea_wrreq_sum", raw.get("tcc_ea0_wrreq_sum", 0.0)),
         "fetch_size_kb": raw.get("fetch_size", 0.0),
         "write_size_kb": raw.get("write_size", 0.0),
         # Timing from stats pass

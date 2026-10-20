@@ -951,8 +951,8 @@ class OptimizationOrchestrator:
                     return [synthetic], None, None
                 return None, None, ncu_metrics
 
-        # Run roofline analysis
-        flat_metrics = next(iter(ncu_metrics.values()), {}) if ncu_metrics else {}
+        # Run roofline analysis. NCU is nested by kernel name; rocprof is flat.
+        flat_metrics = _get_triton_kernel_metrics(ncu_metrics) if ncu_metrics else {}
         roofline_result = self.bottleneck_analyzer.roofline.analyze(flat_metrics)
 
         # Use pre-computed bottleneck if override is set
@@ -1410,9 +1410,10 @@ class OptimizationOrchestrator:
             perf_metrics["bottleneck_addressed"] = bottleneck_category
             perf_metrics["bottleneck_category"] = bottleneck_category
 
-        # Add NCU metrics if available
+        # Add NCU metrics if available. rocprof metrics are a flat counter
+        # dict, so the first value is a scalar rather than a per-kernel map.
         if ncu_metrics:
-            kernel_metrics = next(iter(ncu_metrics.values()), {})
+            kernel_metrics = _get_triton_kernel_metrics(ncu_metrics)
             perf_metrics["memory_throughput"] = kernel_metrics.get(
                 "dram__throughput.avg.pct_of_peak_sustained_elapsed"
             )

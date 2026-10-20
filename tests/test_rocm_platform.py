@@ -161,16 +161,22 @@ def test_bottleneck_analyzer_accepts_num_bottlenecks():
 
 
 def test_yaml_platform_kwargs_select_rocprof_binary(tmp_path, monkeypatch):
+    gpu_name = "GPU_NAME"
+    rocprof_bin_path = "/path/to/rocprofv3"
     monkeypatch.setattr(
         "triton_kernel_agent.opt_worker.get_model_provider",
         lambda *_args, **_kwargs: object(),
     )
+    monkeypatch.setattr(
+        "triton_kernel_agent.platform.rocm.ROCmAcceleratorSpecsProvider.get_specs",
+        lambda _self, device_name=None: {"name": device_name},
+    )
     cfg = tmp_path / "amd.yaml"
     cfg.write_text(
-        """\
+        f"""\
 strategy: greedy
 num_workers: 1
-gpu_name: AMD Instinct MI300X
+gpu_name: {gpu_name}
 target_platform: rocm
 platform:
   verifier: noop
@@ -179,7 +185,7 @@ platform:
   profiler: rocm
   specs_provider: rocm
 platform_kwargs:
-  rocprof_bin_path: /opt/rocm/bin/rocprofv3
+  rocprof_bin_path: {rocprof_bin_path}
 """
     )
     from triton_kernel_agent.opt_manager import OptimizationManager
@@ -190,7 +196,8 @@ platform_kwargs:
         log_dir=tmp_path / "logs",
         gpu_ids=[0],
     )
-    assert manager._mgr_profiler._rocprof_bin_path == "/opt/rocm/bin/rocprofv3"
+    assert manager.worker_kwargs["gpu_name"] == gpu_name
+    assert manager._mgr_profiler._rocprof_bin_path == rocprof_bin_path
 
     worker = OptimizationWorker(
         worker_id=0,
@@ -198,7 +205,8 @@ platform_kwargs:
         log_dir=tmp_path / "worker-logs",
         **manager.worker_kwargs,
     )
-    assert worker.profiler._rocprof_bin_path == "/opt/rocm/bin/rocprofv3"
+    assert worker.gpu_name == gpu_name
+    assert worker.profiler._rocprof_bin_path == rocprof_bin_path
 
 
 def test_worker_runner_matches_multi_gpu_contract():

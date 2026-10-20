@@ -42,6 +42,27 @@ class AnthropicProvider(BaseProvider):
             # Initialize client (proxy configured via environment variables)
             self.client = Anthropic(api_key=api_key)
 
+    def _create_kwargs(
+        self,
+        model_name: str,
+        messages: list[dict[str, str]],
+        temperature: float,
+        **kwargs,
+    ) -> dict:
+        # The installed SDK dropped the temperature argument. The API still
+        # accepts it on the JSON body.
+        params = {
+            "model": model_name,
+            "max_tokens": min(
+                kwargs.get("max_tokens", 8192), self.get_max_tokens_limit(model_name)
+            ),
+            "messages": messages,
+            "extra_body": {"temperature": temperature},
+        }
+        if kwargs.get("high_reasoning_effort"):
+            params["output_config"] = {"effort": "high"}
+        return params
+
     def get_response(
         self, model_name: str, messages: list[dict[str, str]], **kwargs
     ) -> LLMResponse:
@@ -50,12 +71,12 @@ class AnthropicProvider(BaseProvider):
 
         user_content = messages[-1]["content"] if messages else ""
         response = self.client.messages.create(
-            model=model_name,
-            max_tokens=min(
-                kwargs.get("max_tokens", 8192), self.get_max_tokens_limit(model_name)
-            ),
-            temperature=kwargs.get("temperature", 0.7),
-            messages=[{"role": "user", "content": user_content}],
+            **self._create_kwargs(
+                model_name,
+                [{"role": "user", "content": user_content}],
+                kwargs.get("temperature", 0.7),
+                **kwargs,
+            )
         )
 
         return LLMResponse(
@@ -65,11 +86,13 @@ class AnthropicProvider(BaseProvider):
     def get_multiple_responses(
         self, model_name: str, messages: list[dict[str, str]], n: int = 1, **kwargs
     ) -> list[LLMResponse]:
+        base_temperature = kwargs.get("temperature", 0.7)
         return [
             self.get_response(
                 model_name,
                 messages,
-                temperature=kwargs.get("temperature", 0.7) + i * 0.1,
+                temperature=base_temperature + i * 0.1,
+                **{k: v for k, v in kwargs.items() if k != "temperature"},
             )
             for i in range(n)
         ]

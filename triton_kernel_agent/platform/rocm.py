@@ -611,12 +611,13 @@ class ROCmRooflineAnalyzerWrapper(RooflineAnalyzerBase):
             )
 
             kwargs: dict[str, Any] = {"logger": self._logger}
-            if self._roofline_config is not None:
-                # Allow passing either a ROCmRooflineConfig or dict
-                if isinstance(self._roofline_config, dict):
-                    kwargs["config"] = ROCmRooflineConfig(**self._roofline_config)
-                else:
-                    kwargs["config"] = self._roofline_config
+            if isinstance(self._roofline_config, dict):
+                kwargs["config"] = ROCmRooflineConfig(**self._roofline_config)
+            elif isinstance(self._roofline_config, ROCmRooflineConfig):
+                kwargs["config"] = self._roofline_config
+            # OptimizationWorker always supplies the NVIDIA RooflineConfig
+            # default. That object has no ROCm fields, so leave the ROCm
+            # defaults in place instead of forwarding it.
             self._delegate = ROCmRooflineAnalyzer(**kwargs)
         return self._delegate
 
