@@ -107,6 +107,8 @@ class OptimizationWorker:
         platform_kwargs: dict[str, Any] | None = None,
         # Template overrides from YAML config ─────────────────────
         templates: dict[str, str] | None = None,
+        # "triton" (default) or "flydsl" (ROCm only).
+        kernel_language: str = "triton",
     ):
         """
         Initialize the optimization worker.
@@ -164,6 +166,11 @@ class OptimizationWorker:
 
         # Template overrides (forwarded to PromptManager)
         self.templates_config = templates
+        self.kernel_language = kernel_language
+        if kernel_language == "flydsl":
+            from triton_kernel_agent.flydsl_env import ensure_flydsl_rocm_env
+
+            ensure_flydsl_rocm_env()
 
         # BeamSearch parameters
         self.bottleneck_id = bottleneck_id
@@ -282,6 +289,7 @@ class OptimizationWorker:
         self.prompt_manager = PromptManager(
             target_platform=platform_config,
             template_overrides=self.templates_config,
+            kernel_language=self.kernel_language,
         )
 
         # Benchmarking

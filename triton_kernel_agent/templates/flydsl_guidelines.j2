@@ -1,0 +1,40 @@
+{#
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+#}
+
+FLYDSL KERNEL PROGRAMMING GUIDELINES:
+
+You are writing an AMD ROCm kernel in FlyDSL (flydsl.compiler / flydsl.expr), not Triton.
+
+1. STRUCTURE:
+   - Device code is a function decorated with @flyc.kernel
+   - The host launcher is a function decorated with @flyc.jit that calls kernel(...).launch(grid=..., block=...)
+   - The test imports kernel_function. That wrapper allocates outputs and calls the @flyc.jit function
+   - Do not decorate kernel_function with @flyc.kernel or @flyc.jit
+
+2. ARGUMENTS:
+   - GPU tensors are annotated fx.Tensor. Indexing loads and stores: value = A[row, col], C[row, 0] = value
+   - Runtime integers are fx.Int32. Pass sizes from the Python wrapper; do not read A.shape inside @flyc.jit (that value is an IntTuple)
+   - Compile-time integers are fx.Constexpr[int]
+   - Accumulate BF16 and FP16 in fx.Float32, then store fx.BFloat16(acc) or fx.Float16(acc)
+
+3. LAUNCH:
+   - AMD wavefront size is 64. block sizes are multiples of 64 (64, 128, 256, 512)
+   - grid and block are tuples of integers computed from the fx.Int32 sizes
+   - One thread per output row is a correct starting point. Widen loads or split K across the block when the roofline says the kernel is memory bound
+
+4. DEVICE:
+   - Allocate with device='cuda'. ROCm exposes HIP through torch.cuda
+   - Do not import triton. Do not call torch.matmul, torch.nn, or torch.nn.functional to do the math

@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 #}
 
+{% if kernel_language == "flydsl" %}
+TASK: Optimize the following FlyDSL kernel based on hardware profiling analysis to achieve better performance. Keep the implementation in FlyDSL. Do not rewrite it as Triton.
+{% else %}
 TASK: Optimize the following Triton kernel based on hardware profiling analysis to achieve better performance.
+{% endif %}
 
 {% if gpu_specs %}
 ## TARGET GPU
@@ -118,12 +122,21 @@ Guidance for this round:
 ## REQUIREMENTS
 1. Apply the recommended fixes above to address the {{ bottleneck.category | upper }} bottleneck
 2. The implementation must be a complete, valid Python file
+{% if kernel_language == "flydsl" %}
+3. Main function must be named 'kernel_function' wrapping a @flyc.jit launcher. Device code uses @flyc.kernel
+4. Keep the wrapper free of PyTorch compute primitives
+{% else %}
 3. Main function must be named 'kernel_function' wrapping the Triton kernel
 4. Keep the wrapper free of PyTorch compute primitives
+{% endif %}
 
 ## OUTPUT FORMAT
 Output complete optimized kernel code in ```python blocks.
+{% if kernel_language == "flydsl" %}
+Include only: imports, the @flyc.kernel device function, the @flyc.jit launcher, and kernel_function.
+{% else %}
 Include only: imports, Triton kernel (@triton.jit), wrapper function (kernel_function).
+{% endif %}
 No testing code, benchmarks, or explanatory comments.
 
 Generate the complete optimized kernel implementation:

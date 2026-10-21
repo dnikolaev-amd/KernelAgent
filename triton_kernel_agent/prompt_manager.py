@@ -45,6 +45,7 @@ class PromptManager:
         templates_dir: str | None = None,
         target_platform: PlatformConfig | None = None,
         template_overrides: dict[str, str] | None = None,
+        kernel_language: str = "triton",
     ):
         """
         Initialize the prompt manager.
@@ -73,6 +74,7 @@ class PromptManager:
             self.templates_dir = Path(__file__).parent / "templates"
 
         self._template_overrides = template_overrides
+        self.kernel_language = kernel_language
 
         if not self.templates_dir.exists():
             raise FileNotFoundError(
@@ -182,7 +184,7 @@ class PromptManager:
         Returns:
             Rendered prompt string
         """
-        template = self.templates["kernel_generation"]
+        template = self._language_template("kernel_generation")
 
         # Load triton guidelines if not provided
         if triton_guidelines is None:
@@ -192,8 +194,9 @@ class PromptManager:
             problem_description=problem_description,
             test_code=test_code,
             triton_guidelines=triton_guidelines,
-            kernel_guidance=self.target_platform.kernel_guidance,
+            kernel_guidance=self._kernel_guidance(),
             no_cusolver=no_cusolver,
+            kernel_language=self.kernel_language,
         )
 
     def render_kernel_refinement_prompt(
@@ -221,7 +224,7 @@ class PromptManager:
         Returns:
             Rendered prompt string
         """
-        template = self.templates["kernel_refinement"]
+        template = self._language_template("kernel_refinement")
 
         # Load triton guidelines if not provided
         if triton_guidelines is None:
@@ -234,8 +237,9 @@ class PromptManager:
             error_info=error_info,
             history_context=history_context,
             triton_guidelines=triton_guidelines,
-            kernel_guidance=self.target_platform.kernel_guidance,
+            kernel_guidance=self._kernel_guidance(),
             no_cusolver=no_cusolver,
+            kernel_language=self.kernel_language,
         )
 
     def render_kernel_optimization_prompt(
@@ -281,7 +285,7 @@ class PromptManager:
         Returns:
             Rendered prompt string
         """
-        template = self.templates["kernel_optimization"]
+        template = self._language_template("kernel_optimization")
 
         bottleneck = {
             "category": category,
@@ -303,6 +307,7 @@ class PromptManager:
             recent_attempts=recent_attempts,
             reflexions=reflexions,
             rag_context=rag_context,
+            kernel_language=self.kernel_language,
         )
 
     def render_reflexion_prompt(self, attempt) -> str:
@@ -364,8 +369,25 @@ Respond with JSON containing:
         Returns:
             Rendered guidelines string
         """
+        if self.kernel_language == "flydsl":
+            flydsl = self.templates_dir / "flydsl_guidelines.j2"
+            if flydsl.exists():
+                return self.env.get_template("flydsl_guidelines.j2").render()
         template = self.templates["triton_guidelines"]
         return template.render()
+
+    def _language_template(self, name: str):
+        """Use a ``<name>_flydsl.j2`` template when one exists for this language."""
+        if self.kernel_language == "flydsl":
+            filename = f"{name}_flydsl.j2"
+            if (self.templates_dir / filename).exists():
+                return self.env.get_template(filename)
+        return self.templates[name]
+
+    def _kernel_guidance(self) -> str:
+        if self.kernel_language == "flydsl":
+            return ""
+        return self.target_platform.kernel_guidance
 
     def get_template(self, template_name: str) -> Template:
         """
