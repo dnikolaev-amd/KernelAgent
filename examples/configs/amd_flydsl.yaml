@@ -1,11 +1,14 @@
 # AMD + FlyDSL config for MI300X.
 #
-# The starting kernel must be FlyDSL (see examples/optimize_01_matvec_flydsl).
-# kernel_language keeps later rounds in FlyDSL instead of Triton.
+# The starting kernel must be FlyDSL. kernel_language keeps later rounds in
+# FlyDSL instead of Triton.
 #
 # Usage:
 #   python examples/run_opt_manager.py \
 #       --kernel-dir examples/optimize_01_matvec_flydsl \
+#       --strategy amd_flydsl
+#   python examples/run_opt_manager.py \
+#       --kernel-dir examples/optimize_02_rmsnorm_flydsl \
 #       --strategy amd_flydsl
 
 strategy: beam_search
