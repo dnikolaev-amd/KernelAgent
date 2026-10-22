@@ -166,8 +166,10 @@ class OptimizationWorker:
 
         # Template overrides (forwarded to PromptManager)
         self.templates_config = templates
-        self.kernel_language = kernel_language
-        if kernel_language == "flydsl":
+        from triton_kernel_agent.prompt_manager import check_kernel_language
+
+        self.kernel_language = check_kernel_language(kernel_language)
+        if self.kernel_language == "flydsl":
             from triton_kernel_agent.flydsl_env import ensure_flydsl_rocm_env
 
             ensure_flydsl_rocm_env()

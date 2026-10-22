@@ -29,6 +29,18 @@ except ImportError:
     Template = None
 
 
+KERNEL_LANGUAGES = ("triton", "flydsl")
+
+
+def check_kernel_language(kernel_language: str) -> str:
+    """Return ``kernel_language`` when it is ``triton`` or ``flydsl``."""
+    if kernel_language not in KERNEL_LANGUAGES:
+        raise ValueError(
+            f"kernel_language must be 'triton' or 'flydsl', got {kernel_language!r}"
+        )
+    return kernel_language
+
+
 class PromptManager:
     """
     Manages Jinja2 templates for prompt generation.
@@ -57,6 +69,10 @@ class PromptManager:
                 absolute file paths for custom .j2 files.  Only the optimization
                 templates (kernel_optimization, reflexion_prompt, triton_guidelines)
                 can be overridden; other keys are ignored.
+            kernel_language: ``"triton"`` or ``"flydsl"``. Any other value
+                raises ``ValueError``. For ``"flydsl"``, a
+                ``triton_guidelines`` override replaces the bundled FlyDSL
+                guidelines; otherwise ``flydsl_guidelines.j2`` is used.
         """
         if not JINJA2_AVAILABLE:
             raise ImportError(
@@ -74,7 +90,7 @@ class PromptManager:
             self.templates_dir = Path(__file__).parent / "templates"
 
         self._template_overrides = template_overrides
-        self.kernel_language = kernel_language
+        self.kernel_language = check_kernel_language(kernel_language)
 
         if not self.templates_dir.exists():
             raise FileNotFoundError(
@@ -308,6 +324,7 @@ class PromptManager:
             reflexions=reflexions,
             rag_context=rag_context,
             kernel_language=self.kernel_language,
+            triton_guidelines=self.render_triton_guidelines(),
         )
 
     def render_reflexion_prompt(self, attempt) -> str:
@@ -370,6 +387,10 @@ Respond with JSON containing:
             Rendered guidelines string
         """
         if self.kernel_language == "flydsl":
+            # A YAML triton_guidelines override is loaded into self.templates.
+            # Without one, the bundled FlyDSL guidelines apply.
+            if (self._template_overrides or {}).get("triton_guidelines"):
+                return self.templates["triton_guidelines"].render()
             flydsl = self.templates_dir / "flydsl_guidelines.j2"
             if flydsl.exists():
                 return self.env.get_template("flydsl_guidelines.j2").render()

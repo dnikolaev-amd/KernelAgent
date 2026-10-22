@@ -15,6 +15,8 @@ limitations under the License.
 #}
 
 {% if kernel_language == "flydsl" %}
+{{ triton_guidelines }}
+
 TASK: Optimize the following FlyDSL kernel based on hardware profiling analysis to achieve better performance. Keep the implementation in FlyDSL. Do not rewrite it as Triton.
 {% else %}
 TASK: Optimize the following Triton kernel based on hardware profiling analysis to achieve better performance.

@@ -161,6 +161,9 @@ class OptimizationManager:
         self.high_reasoning_effort = high_reasoning_effort
         self.bottleneck_override = bottleneck_override
         self.worker_kwargs = worker_kwargs
+        from triton_kernel_agent.prompt_manager import check_kernel_language
+
+        check_kernel_language(self.worker_kwargs.get("kernel_language", "triton"))
 
         # Store template overrides (also stays in worker_kwargs for forwarding)
         self.templates_config = worker_kwargs.get("templates")
@@ -447,6 +450,14 @@ class OptimizationManager:
             problem_id=str(problem_file),
         )
         self.strategy.initialize(initial_entry)
+
+        # Initial verify and the starter benchmark run in this process,
+        # before any OptimizationWorker exists. FlyDSL's linker env has to
+        # be set here so those subprocesses inherit it.
+        if self.worker_kwargs.get("kernel_language", "triton") == "flydsl":
+            from triton_kernel_agent.flydsl_env import ensure_flydsl_rocm_env
+
+            ensure_flydsl_rocm_env()
 
         # Verify initial kernel correctness before investing in benchmarks/optimization
         if not self._verify_initial_kernel(initial_kernel, problem_file, test_code):

@@ -1,5 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -22,10 +20,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import gpu
-
-from triton_kernel_agent.flydsl_env import ensure_flydsl_rocm_env
-
-ensure_flydsl_rocm_env()
 
 BLOCK = 64
 
