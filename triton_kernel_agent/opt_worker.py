@@ -351,6 +351,7 @@ class OptimizationWorker:
             openai_model=self.openai_model,
             high_reasoning_effort=self.high_reasoning_effort,
             target_platform=self.target_platform,
+            kernel_language=self.kernel_language,
         )
 
         # Roofline analyzer

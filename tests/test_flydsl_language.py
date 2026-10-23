@@ -20,6 +20,7 @@ import pytest
 from triton_kernel_agent.opt_manager import OptimizationManager
 from triton_kernel_agent.platform_config import get_platform
 from triton_kernel_agent.prompt_manager import PromptManager, check_kernel_language
+from triton_kernel_agent.worker import VerificationWorker, flydsl_language_violation
 
 _REPO = Path(__file__).resolve().parents[1]
 _FLYDSL_RULES = ("fx.Int32", "A.shape", "wavefront")
@@ -180,6 +181,33 @@ def test_manager_sets_flydsl_env_before_initial_verify(tmp_path, monkeypatch):
             test_code="def test_kernel():\n    pass\n",
         )
     assert order == ["ensure", "verify", "eager", "compile", "kernel"]
+
+
+def test_flydsl_candidate_must_stay_flydsl():
+    triton_kernel = "import triton\n\n@triton.jit\ndef kernel():\n    return\n"
+    assert flydsl_language_violation(triton_kernel)
+
+    commented = "# do not use triton here\n@flyc.kernel\ndef kernel():\n    return\n"
+    assert flydsl_language_violation(commented) is None
+
+    starter = (_REPO / "examples/optimize_01_matvec_flydsl/input.py").read_text()
+    assert flydsl_language_violation(starter) is None
+
+
+def test_flydsl_worker_rejects_triton_before_running_the_test(tmp_path):
+    worker = VerificationWorker(
+        worker_id=0,
+        workdir=tmp_path,
+        log_dir=tmp_path,
+        kernel_language="flydsl",
+    )
+    success, _stdout, stderr, violation = worker._single_verification_pass(
+        "import triton\n\n@triton.jit\ndef kernel():\n    return\n"
+    )
+    assert success is False
+    assert violation
+    assert "flydsl" in stderr
+    assert worker.prompt_manager.kernel_language == "flydsl"
 
 
 def test_starters_do_not_import_the_package():

@@ -131,9 +131,15 @@ class ROCmVerifier(KernelVerifier):
     ``torch.cuda`` via HIP so no changes are needed at the verification level.
     """
 
-    def __init__(self, log_dir: Path, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        log_dir: Path,
+        logger: logging.Logger,
+        kernel_language: str = "triton",
+    ) -> None:
         self.log_dir = log_dir
         self.logger = logger
+        self.kernel_language = kernel_language
 
     def verify(
         self,
@@ -153,6 +159,7 @@ class ROCmVerifier(KernelVerifier):
             workdir=verify_dir,
             log_dir=verify_dir,
             target_platform="rocm",
+            kernel_language=self.kernel_language,
         )
 
         success, _, error = worker.verify_with_refinement(

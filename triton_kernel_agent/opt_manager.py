@@ -288,6 +288,7 @@ class OptimizationManager:
             profiling_semaphore=self.profiling_semaphore,
             openai_model=self.openai_model,
             high_reasoning_effort=self.high_reasoning_effort,
+            kernel_language=self.worker_kwargs.get("kernel_language", "triton"),
             bottleneck_override=self.bottleneck_override,
             worker_kwargs=self.worker_kwargs,
             gpu_ids=self.gpu_ids,

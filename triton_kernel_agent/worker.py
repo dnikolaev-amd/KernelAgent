@@ -31,7 +31,7 @@ from triton_kernel_agent.platform_config import get_platform, resolve_test_timeo
 from triton_kernel_agent.worker_util import format_test_code_for_llm
 from utils.providers import get_model_provider
 
-from .prompt_manager import PromptManager
+from .prompt_manager import PromptManager, check_kernel_language
 from .worker_util import _run_test_multiprocess
 
 
@@ -120,6 +120,27 @@ DISALLOWED_TORCH_PATTERNS = [
     ),
 ]
 
+_COMMENT_OR_STRING = re.compile(r'("""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|#.*)')
+_TRITON_NAME = re.compile(r"\btriton\b")
+_FLYC_KERNEL = re.compile(r"@flyc\.kernel\b")
+
+
+def flydsl_language_violation(kernel_code: str) -> str | None:
+    """Return an error when a FlyDSL candidate is not FlyDSL.
+
+    Comments and strings are ignored, so a note that mentions Triton does
+    not fail a kernel whose device code is ``@flyc.kernel``.
+    """
+    sanitized = _COMMENT_OR_STRING.sub("", kernel_code)
+    if _TRITON_NAME.search(sanitized):
+        return (
+            "kernel_language is flydsl. Keep the kernel in FlyDSL. "
+            "Do not import triton or use @triton.jit."
+        )
+    if not _FLYC_KERNEL.search(sanitized):
+        return "kernel_language is flydsl. Device code must use @flyc.kernel."
+    return None
+
 
 class VerificationWorker:
     """Worker that verifies and refines a single kernel implementation."""
@@ -137,6 +158,7 @@ class VerificationWorker:
         target_platform: str = "cuda",
         no_cusolver: bool = False,
         test_timeout_s: int | None = None,
+        kernel_language: str = "triton",
     ):
         """
         Initialize a verification worker.
@@ -153,6 +175,8 @@ class VerificationWorker:
             target_platform: Target platform default: cuda
             no_cusolver: If True, disables cuSolver library usage
             test_timeout_s: Timeout in seconds for test execution
+            kernel_language: ``"triton"`` or ``"flydsl"``. FlyDSL runs reject
+                candidates that are not FlyDSL.
         """
         self.worker_id = worker_id
         self.workdir = Path(workdir)
@@ -164,6 +188,7 @@ class VerificationWorker:
         self._platform_config = get_platform(target_platform)
         self.no_cusolver = no_cusolver
         self.test_timeout_s = resolve_test_timeout_s(test_timeout_s, target_platform)
+        self.kernel_language = check_kernel_language(kernel_language)
 
         # Setup files
         self.kernel_file = self.workdir / "kernel.py"
@@ -176,7 +201,10 @@ class VerificationWorker:
         self._setup_logging()
 
         # Initialize prompt manager with resolved config
-        self.prompt_manager = PromptManager(target_platform=self._platform_config)
+        self.prompt_manager = PromptManager(
+            target_platform=self._platform_config,
+            kernel_language=self.kernel_language,
+        )
 
         # Initialize provider (may be unavailable in offline/test environments)
         self.provider = None
@@ -662,8 +690,15 @@ class VerificationWorker:
 
         Returns:
             Tuple of (success, stdout, stderr, violation_message)
-            - violation_message is set if PyTorch usage detected, None otherwise
+            - violation_message is set for a FlyDSL language miss or
+              disallowed PyTorch usage, None otherwise
         """
+        if self.kernel_language == "flydsl":
+            violation = flydsl_language_violation(kernel_code)
+            if violation:
+                self.logger.error(violation)
+                return False, "", violation, violation
+
         violation = self._detect_pytorch_compute(kernel_code)
         if violation:
             message = f"Disallowed PyTorch usage detected: {violation}"

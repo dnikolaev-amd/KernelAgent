@@ -49,9 +49,15 @@ from triton_kernel_agent.platform.interfaces import (
 class NvidiaVerifier(KernelVerifier):
     """Verifies kernel correctness using ``VerificationWorker`` on CUDA."""
 
-    def __init__(self, log_dir: Path, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        log_dir: Path,
+        logger: logging.Logger,
+        kernel_language: str = "triton",
+    ) -> None:
         self.log_dir = log_dir
         self.logger = logger
+        self.kernel_language = kernel_language
 
     def verify(
         self,
@@ -70,6 +76,7 @@ class NvidiaVerifier(KernelVerifier):
             worker_id=-1,
             workdir=verify_dir,
             log_dir=verify_dir,
+            kernel_language=self.kernel_language,
         )
 
         success, _, error = worker.verify_with_refinement(
