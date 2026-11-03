@@ -297,6 +297,71 @@ def _run_amd_smi(args: list[str]) -> str | None:
     return out.stdout
 
 
+def _visibility_mask(value: str | None) -> tuple[str, list[int]]:
+    """Classify a device-visibility variable.
+
+    ``"unset"`` means the variable is absent and does not filter.
+    ``"index"`` is a comma-separated list of integers. An empty value is
+    an empty list and hides every device. ``"opaque"`` means a token is
+    not an integer (a UUID); the caller must not guess which device it
+    names.
+    """
+    if value is None:
+        return "unset", []
+    ids: list[int] = []
+    for part in value.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            return "opaque", []
+        ids.append(int(token))
+    return "index", ids
+
+
+def _restrict_hip_ids(ids: list[int]) -> list[int]:
+    """Drop HIP ids that ROCm PyTorch cannot see.
+
+    ``amd-smi`` ignores ``HIP_VISIBLE_DEVICES`` and ``ROCR_VISIBLE_DEVICES``.
+    An integer mask names HIP ids, not ``HSA_ID`` values and not
+    ``nvidia-smi`` indexes. ``CUDA_VISIBLE_DEVICES`` is applied only when
+    neither ROCm mask is an integer list: a mask that includes the device
+    keeps it visible when ``CUDA_VISIBLE_DEVICES`` names another index, and
+    a mask that excludes the HIP id stays hidden after that variable is set.
+    """
+    visible = list(ids)
+    rocm_mask = False
+    for name in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"):
+        kind, mask = _visibility_mask(os.environ.get(name))
+        if kind != "index":
+            continue
+        rocm_mask = True
+        allowed = set(mask)
+        visible = [gpu_id for gpu_id in visible if gpu_id in allowed]
+    if rocm_mask:
+        return visible
+    kind, mask = _visibility_mask(os.environ.get("CUDA_VISIBLE_DEVICES"))
+    if kind != "index":
+        return visible
+    allowed = set(mask)
+    return [gpu_id for gpu_id in visible if gpu_id in allowed]
+
+
+def _pin_rocm_gpu(gpu_id: int) -> None:
+    """Pin this process to one HIP id.
+
+    ``gpu_id`` is a HIP id that survived ``_restrict_hip_ids``. Integer
+    ROCm masks are removed so ``CUDA_VISIBLE_DEVICES`` selects that HIP
+    id. Leaving either mask set hides the device even when
+    ``CUDA_VISIBLE_DEVICES`` names it. A UUID mask is left in place.
+    """
+    for name in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"):
+        kind, _mask = _visibility_mask(os.environ.get(name))
+        if kind == "index":
+            os.environ.pop(name, None)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+
 def _visible_hip_id() -> int:
     """HIP id of torch device 0. ``CUDA_VISIBLE_DEVICES`` selects it."""
     for part in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(","):
@@ -653,7 +718,7 @@ def _rocm_worker_process(
     import os
     import sys
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    _pin_rocm_gpu(gpu_id)
     print(
         f"[worker {worker_id}] pinned to GPU {gpu_id} "
         f"(CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})",

@@ -15,6 +15,7 @@
 """ROCm platform wiring that must hold without an AMD GPU."""
 
 import inspect
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -663,3 +664,163 @@ def test_detect_gpus_falls_back_to_one_gpu(monkeypatch):
         "triton_kernel_agent.opt_manager._query_smi", lambda argv: None
     )
     assert _detect_gpus() == [0]
+
+
+_AMD_SMI = "/opt/rocm/bin/amd-smi"
+_HIP_LIST = "GPU: 0\n    HIP_ID: 0\nGPU: 1\n    HIP_ID: 3\n"
+
+
+def _mock_rocm_listing(monkeypatch, hip_text=_HIP_LIST):
+    """Return HIP ids from amd-smi. A ROCm listing must not ask nvidia-smi."""
+
+    def query(argv):
+        if argv[0] == "nvidia-smi":
+            raise AssertionError(argv)
+        if argv == [_AMD_SMI, "list", "-e"]:
+            return hip_text
+        return None
+
+    monkeypatch.setattr(
+        "triton_kernel_agent.platform.rocm._find_amd_smi", lambda: _AMD_SMI
+    )
+    monkeypatch.setattr("triton_kernel_agent.opt_manager._query_smi", query)
+
+
+def _clear_device_masks(monkeypatch):
+    for name in (
+        "CUDA_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_rocm_detection_uses_hip_ids_when_nvidia_smi_succeeds(monkeypatch):
+    from triton_kernel_agent.opt_manager import _detect_gpus
+
+    _clear_device_masks(monkeypatch)
+
+    def query(argv):
+        if argv[0] == "nvidia-smi":
+            raise AssertionError(argv)
+        if argv == [_AMD_SMI, "list", "-e"]:
+            return _HIP_LIST
+        return None
+
+    monkeypatch.setattr(
+        "triton_kernel_agent.platform.rocm._find_amd_smi", lambda: _AMD_SMI
+    )
+    monkeypatch.setattr("triton_kernel_agent.opt_manager._query_smi", query)
+    assert _detect_gpus(platform="rocm") == [0, 3]
+    assert _detect_gpus(target_platform="rocm") == [0, 3]
+    assert (
+        _detect_gpus(
+            platform={"worker_runner": "rocm", "profiler": "rocm"},
+            target_platform="rocm",
+        )
+        == [0, 3]
+    )
+
+
+def test_nvidia_detection_ignores_rocm_masks(monkeypatch):
+    from triton_kernel_agent.opt_manager import _detect_gpus
+
+    _clear_device_masks(monkeypatch)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "9")
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "9")
+
+    def query(argv):
+        if argv[0] == "nvidia-smi":
+            return "0\n"
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("triton_kernel_agent.opt_manager._query_smi", query)
+    assert _detect_gpus() == [0]
+    assert _detect_gpus(platform="nvidia", target_platform="cuda") == [0]
+
+
+def test_rocm_detection_applies_visibility_masks(monkeypatch):
+    from triton_kernel_agent.opt_manager import _detect_gpus
+
+    _mock_rocm_listing(monkeypatch, hip_text="GPU: 0\n    HIP_ID: 0\n")
+
+    _clear_device_masks(monkeypatch)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "9")
+    assert _detect_gpus(platform="rocm") == []
+
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "")
+    assert _detect_gpus(platform="rocm") == []
+
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES")
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "2")
+    assert _detect_gpus(platform="rocm") == []
+
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "9")
+    assert _detect_gpus(platform="rocm") == []
+
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "9")
+    assert _detect_gpus(platform="rocm") == []
+
+    # CUDA_VISIBLE_DEVICES cannot bring back a device the ROCm mask hid,
+    # and it cannot hide a device the ROCm mask still exposes.
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    assert _detect_gpus(platform="rocm") == [0]
+
+    _clear_device_masks(monkeypatch)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    assert _detect_gpus(platform="rocm") == []
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    assert _detect_gpus(platform="rocm") == []
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    assert _detect_gpus(platform="rocm") == [0]
+
+    _clear_device_masks(monkeypatch)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0,9")
+    assert _detect_gpus(platform="rocm") == [0]
+
+    # A UUID is not a HIP id. Leave the listed ids in place.
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "GPU-56b16882705b44f6")
+    assert _detect_gpus(platform="rocm") == [0]
+
+
+def test_pin_rocm_gpu_clears_integer_masks(monkeypatch):
+    from triton_kernel_agent.platform.rocm import _pin_rocm_gpu
+
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "9")
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "2")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    _pin_rocm_gpu(0)
+    assert "HIP_VISIBLE_DEVICES" not in os.environ
+    assert "ROCR_VISIBLE_DEVICES" not in os.environ
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_pin_rocm_gpu_keeps_a_uuid_mask(monkeypatch):
+    from triton_kernel_agent.platform.rocm import _pin_rocm_gpu
+
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "GPU-56b16882705b44f6")
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    _pin_rocm_gpu(0)
+    assert os.environ["HIP_VISIBLE_DEVICES"] == "GPU-56b16882705b44f6"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_rocm_manager_rejects_an_empty_visible_set(tmp_path, monkeypatch):
+    from triton_kernel_agent.opt_manager import OptimizationManager
+
+    monkeypatch.setattr(
+        "triton_kernel_agent.opt_manager._detect_gpus",
+        lambda *_args, **_kwargs: [],
+    )
+    with pytest.raises(RuntimeError, match="No visible GPU"):
+        OptimizationManager(
+            strategy="greedy",
+            num_workers=1,
+            log_dir=tmp_path / "logs",
+            platform="rocm",
+        )

@@ -103,8 +103,60 @@ def _parse_nvidia_smi_gpu_ids(text: str) -> list[int]:
     return ids
 
 
-def _detect_gpus() -> list[int]:
-    """Return physical GPU ids visible to this process.
+def _uses_rocm_platform(platform: Any, target_platform: Any) -> bool:
+    """True when this run's devices are HIP ids, not ``nvidia-smi`` indexes."""
+    if isinstance(target_platform, str) and target_platform.lower() == "rocm":
+        return True
+    if isinstance(platform, str):
+        return platform.lower() == "rocm"
+    if isinstance(platform, dict):
+        return any(str(value).lower() == "rocm" for value in platform.values())
+    return False
+
+
+def _hip_ids_from_amd_smi() -> list[int] | None:
+    """HIP ids from ``amd-smi``, or None when the tool cannot list them."""
+    from triton_kernel_agent.platform.rocm import _find_amd_smi
+
+    amd_smi = _find_amd_smi()
+    if not amd_smi:
+        return None
+    for args in (["list", "-e"], ["list"]):
+        listed = _query_smi([amd_smi, *args])
+        if not listed:
+            continue
+        ids = _parse_amd_smi_gpu_ids(listed)
+        if ids:
+            return ids
+    return None
+
+
+def _detect_rocm_gpus() -> list[int]:
+    """HIP ids visible to a ROCm process.
+
+    ``nvidia-smi`` is not consulted. On a machine that also has an NVIDIA
+    GPU, its indexes are a different set of devices, and pinning a ROCm
+    worker to one of them leaves the worker with no AMD device.
+    """
+    import os
+
+    from triton_kernel_agent.platform.rocm import (
+        _restrict_hip_ids,
+        _visibility_mask,
+    )
+
+    ids = _hip_ids_from_amd_smi()
+    if not ids:
+        kind, cvd = _visibility_mask(os.environ.get("CUDA_VISIBLE_DEVICES"))
+        ids = list(cvd) if kind == "index" and cvd else [0]
+    return _restrict_hip_ids(ids)
+
+
+def _detect_gpus(
+    platform: Any = None,
+    target_platform: Any = None,
+) -> list[int]:
+    """Return GPU ids visible to this process.
 
     Crucially this MUST NOT initialize the CUDA context in the manager
     process — workers are spawned via ``mp.Process`` (fork on Linux), and
@@ -113,7 +165,11 @@ def _detect_gpus() -> list[int]:
     ``CUDA_VISIBLE_DEVICES`` override. Listing goes through subprocess
     tools instead of ``torch.cuda``.
 
-    Order of resolution:
+    A ROCm run (``platform`` or ``target_platform``) uses HIP ids from
+    ``amd-smi`` and then applies ``HIP_VISIBLE_DEVICES`` and
+    ``ROCR_VISIBLE_DEVICES``. ``amd-smi`` does not apply those masks.
+
+    An NVIDIA run resolves:
       1. ``CUDA_VISIBLE_DEVICES`` env (respect user restriction).
       2. ``nvidia-smi --query-gpu=index --format=csv,noheader``.
       3. ``amd-smi list -e`` HIP ids, then ``amd-smi list``.
@@ -122,7 +178,8 @@ def _detect_gpus() -> list[int]:
     """
     import os
 
-    from triton_kernel_agent.platform.rocm import _find_amd_smi
+    if _uses_rocm_platform(platform, target_platform):
+        return _detect_rocm_gpus()
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cvd:
@@ -139,15 +196,9 @@ def _detect_gpus() -> list[int]:
         ids = _parse_nvidia_smi_gpu_ids(nvidia)
         if ids:
             return ids
-    amd_smi = _find_amd_smi()
-    if amd_smi:
-        for args in (["list", "-e"], ["list"]):
-            listed = _query_smi([amd_smi, *args])
-            if not listed:
-                continue
-            ids = _parse_amd_smi_gpu_ids(listed)
-            if ids:
-                return ids
+    ids = _hip_ids_from_amd_smi()
+    if ids:
+        return ids
     return [0]
 
 
@@ -258,7 +309,18 @@ class OptimizationManager:
         # parallel; workers on the same GPU serialize.  This is the
         # "collapsed" multi-GPU design: a single shared object per GPU
         # acts as both ``benchmark_lock`` and ``profiling_semaphore``.
-        self.gpu_ids: list[int] = list(gpu_ids) if gpu_ids else _detect_gpus()
+        self.gpu_ids: list[int] = (
+            list(gpu_ids)
+            if gpu_ids
+            else _detect_gpus(platform, worker_kwargs.get("target_platform"))
+        )
+        if not self.gpu_ids:
+            raise RuntimeError(
+                "No visible GPU for this platform. A ROCm run uses amd-smi "
+                "HIP ids and does not use nvidia-smi indexes. "
+                "HIP_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES hide devices "
+                "from ROCm PyTorch even though amd-smi still lists them."
+            )
         self.gpu_locks: dict[int, Any] = {g: mp.Lock() for g in self.gpu_ids}
 
         # Manager-level GPU work (initial-kernel verify, PyTorch baselines,
