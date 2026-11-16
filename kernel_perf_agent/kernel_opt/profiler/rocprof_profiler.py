@@ -119,15 +119,20 @@ ROCM_METRIC_KEYS = [
 
 
 def _find_rocprof() -> str:
-    """Find ``rocprofv3`` on PATH, beside Python, or under ``/opt/rocm/bin``."""
-    found = shutil.which("rocprofv3")
-    if found:
-        return found
+    """Find ``rocprofv3`` beside this Python, then on PATH, then ``/opt/rocm``.
+
+    ROCm 10 and later install ``rocprofv3`` beside the Python interpreter.
+    That copy matches this PyTorch. One earlier on PATH can load a different
+    profiler SDK. ``/opt/rocm/bin/rocprofv3`` is the layout from older ROCm.
+    """
     # A venv python is often a symlink. Look beside the symlink first.
     for executable in (Path(sys.executable), Path(sys.executable).resolve()):
         sibling = executable.with_name("rocprofv3")
         if sibling.is_file():
             return str(sibling)
+    found = shutil.which("rocprofv3")
+    if found:
+        return found
     bundled = Path("/opt/rocm/bin/rocprofv3")
     if bundled.is_file():
         return str(bundled)

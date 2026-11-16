@@ -266,7 +266,7 @@ When targeting AMD ROCm 10.1 or later, KernelAgent automatically:
 - Applies ROCm-specific Triton block/wave occupancy hints
 - Generates appropriate device availability checks
 
-See `examples/configs/amd.yaml` for a ready-to-use MI300X configuration.
+See `examples/configs/amd.yaml` for a ready-to-use configuration. It leaves `gpu_name` unset so the detected GPU selects the specs row.
 
 ### Intel XPU Notes
 

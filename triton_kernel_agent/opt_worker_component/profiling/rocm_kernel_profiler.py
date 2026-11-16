@@ -118,11 +118,13 @@ class ROCmKernelProfiler:
     @cached_property
     def rocprof_bin(self) -> str | None:
         """Resolved rocprof binary path (cached)."""
-        import shutil
-
         if self.rocprof_bin_path:
             return self.rocprof_bin_path
-        return shutil.which("rocprofv3")
+        from kernel_perf_agent.kernel_opt.profiler.rocprof_profiler import (
+            _find_rocprof,
+        )
+
+        return _find_rocprof()
 
     def _wait_with_backoff(self, attempt: int) -> None:
         wait_time = 2**attempt

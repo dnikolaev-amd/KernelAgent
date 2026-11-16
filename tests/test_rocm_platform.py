@@ -893,6 +893,7 @@ def test_rocprof_timeout_is_not_retried(tmp_path, monkeypatch):
         logger=logging.getLogger("rocprof-timeout"),
         artifacts_dir=tmp_path,
         logs_dir=tmp_path,
+        rocprof_bin_path="/fake/rocprofv3",
     )
     result = profiler._profile_kernel_impl(
         wrapper_file=tmp_path / "wrap.py",
@@ -1059,6 +1060,167 @@ def test_find_amd_smi_uses_opt_rocm_bin(monkeypatch, tmp_path):
 
     monkeypatch.setattr(Path, "is_file", is_file)
     assert _find_amd_smi() == str(bundled)
+
+
+def test_amd_strategy_config_omits_gpu_name():
+    from omegaconf import OmegaConf
+
+    config = Path(__file__).resolve().parents[1] / "examples/configs/amd.yaml"
+    cfg = OmegaConf.load(config)
+    assert cfg.get("gpu_name") in (None, "")
+
+
+def test_rocprof_beside_symlink_beats_resolved_and_path(monkeypatch, tmp_path):
+    from kernel_perf_agent.kernel_opt.profiler.rocprof_profiler import _find_rocprof
+
+    link_dir = tmp_path / "venv" / "bin"
+    real_dir = tmp_path / "real"
+    link_dir.mkdir(parents=True)
+    real_dir.mkdir()
+    real_python = real_dir / "python3"
+    real_python.write_text("")
+    python = link_dir / "python"
+    python.symlink_to(real_python)
+    sibling = link_dir / "rocprofv3"
+    sibling.write_text("")
+    (real_dir / "rocprofv3").write_text("")
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.shutil.which",
+        lambda _name: "/usr/bin/rocprofv3",
+    )
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.sys.executable",
+        str(python),
+    )
+    assert _find_rocprof() == str(sibling)
+
+
+def test_rocprof_beside_resolved_python_beats_path(monkeypatch, tmp_path):
+    from kernel_perf_agent.kernel_opt.profiler.rocprof_profiler import _find_rocprof
+
+    link_dir = tmp_path / "venv" / "bin"
+    real_dir = tmp_path / "real"
+    link_dir.mkdir(parents=True)
+    real_dir.mkdir()
+    real_python = real_dir / "python3"
+    real_python.write_text("")
+    python = link_dir / "python"
+    python.symlink_to(real_python)
+    resolved = real_dir / "rocprofv3"
+    resolved.write_text("")
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.shutil.which",
+        lambda _name: "/usr/bin/rocprofv3",
+    )
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.sys.executable",
+        str(python),
+    )
+    assert _find_rocprof() == str(resolved)
+
+
+def test_rocprof_path_is_used_when_no_sibling(monkeypatch, tmp_path):
+    from kernel_perf_agent.kernel_opt.profiler.rocprof_profiler import _find_rocprof
+
+    python = tmp_path / "python"
+    python.write_text("")
+    bundled = Path("/opt/rocm/bin/rocprofv3")
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.shutil.which",
+        lambda name: "/usr/bin/rocprofv3" if name == "rocprofv3" else None,
+    )
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.sys.executable",
+        str(python),
+    )
+    real_is_file = Path.is_file
+
+    def is_file(self):
+        if self == bundled:
+            return True
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    assert _find_rocprof() == "/usr/bin/rocprofv3"
+
+
+def test_rocprof_old_opt_rocm_bin_is_last_resort(monkeypatch, tmp_path):
+    from kernel_perf_agent.kernel_opt.profiler.rocprof_profiler import _find_rocprof
+
+    python = tmp_path / "python"
+    python.write_text("")
+    bundled = Path("/opt/rocm/bin/rocprofv3")
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.shutil.which",
+        lambda _name: None,
+    )
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.sys.executable",
+        str(python),
+    )
+    real_is_file = Path.is_file
+
+    def is_file(self):
+        if self == bundled:
+            return True
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    assert _find_rocprof() == str(bundled)
+
+
+def test_rocprof_missing_raises(monkeypatch, tmp_path):
+    from kernel_perf_agent.kernel_opt.profiler.rocprof_profiler import _find_rocprof
+
+    python = tmp_path / "python"
+    python.write_text("")
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.shutil.which",
+        lambda _name: None,
+    )
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.sys.executable",
+        str(python),
+    )
+    monkeypatch.setattr(Path, "is_file", lambda _self: False)
+    with pytest.raises(FileNotFoundError, match="rocprofv3 not found"):
+        _find_rocprof()
+
+
+def test_profiler_uses_the_rocprof_beside_python(monkeypatch, tmp_path):
+    import logging
+
+    from triton_kernel_agent.opt_worker_component.profiling.rocm_kernel_profiler import (
+        ROCmKernelProfiler,
+    )
+
+    link_dir = tmp_path / "venv" / "bin"
+    link_dir.mkdir(parents=True)
+    python = link_dir / "python"
+    python.write_text("")
+    sibling = link_dir / "rocprofv3"
+    sibling.write_text("")
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.shutil.which",
+        lambda _name: "/usr/bin/rocprofv3",
+    )
+    monkeypatch.setattr(
+        "kernel_perf_agent.kernel_opt.profiler.rocprof_profiler.sys.executable",
+        str(python),
+    )
+    profiler = ROCmKernelProfiler(
+        logger=logging.getLogger("test-rocprof"),
+        artifacts_dir=tmp_path,
+        logs_dir=tmp_path,
+    )
+    assert profiler.rocprof_bin == str(sibling)
+    explicit = ROCmKernelProfiler(
+        logger=logging.getLogger("test-rocprof"),
+        artifacts_dir=tmp_path,
+        logs_dir=tmp_path,
+        rocprof_bin_path="/custom/bin/rocprofv3",
+    )
+    assert explicit.rocprof_bin == "/custom/bin/rocprofv3"
 
 
 def test_mixed_node_uses_nvidia_unless_hip_visible_devices(monkeypatch):
