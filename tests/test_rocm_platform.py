@@ -439,15 +439,42 @@ def test_detect_amd_gpu_name_returns_none_without_a_name(monkeypatch):
     assert rocm.detect_amd_gpu_name() is None
 
 
-def test_detect_amd_gpu_name_returns_none_when_no_gpu_is_visible(monkeypatch):
+def test_detect_amd_gpu_name_none_when_hip_mask_selects_nothing(monkeypatch):
     from triton_kernel_agent.platform import rocm
 
-    def no_gpu():
-        raise RuntimeError("no GPU visible")
+    asic = (
+        "GPU: 0\n    MARKET_NAME: AMD Instinct MI300X\n"
+        "    DEVICE_ID: 0x74a1\n    NUM_COMPUTE_UNITS: 304\n"
+    )
+    listing = "GPU: 0\n    HIP_ID: 0\n"
+
+    def run(args):
+        if args == ["static", "--asic"]:
+            return asic
+        if args == ["list", "-e"]:
+            return listing
+        return None
+
+    monkeypatch.setattr(rocm, "_run_amd_smi", run)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+    assert rocm.detect_amd_gpu_name() == "AMD Instinct MI300X"
+
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "9")
+    assert rocm.detect_amd_gpu_name() is None
+
+
+def test_detect_amd_gpu_name_propagates_unexpected_errors(monkeypatch):
+    from triton_kernel_agent.platform import rocm
+
+    def broken():
+        raise RuntimeError("parser broke")
 
     monkeypatch.setattr(rocm, "_run_amd_smi", lambda args: "GPU: 0\n")
-    monkeypatch.setattr(rocm, "_visible_hip_listing", no_gpu)
-    assert rocm.detect_amd_gpu_name() is None
+    monkeypatch.setattr(rocm, "_visible_hip_listing", broken)
+    with pytest.raises(RuntimeError, match="parser broke"):
+        rocm.detect_amd_gpu_name()
 
 
 def test_detect_amd_gpu_name_reads_asic_once(monkeypatch):
@@ -723,6 +750,37 @@ def test_duration_is_the_last_triton_dispatch(tmp_path):
     metrics = _merge_rocprof_outputs(stats, pmc)
     # Last triton_add is 20000 ns. The later _reduce_kernel is not the duration.
     assert metrics["duration_ms"] == pytest.approx(0.02)
+
+
+def test_busier_helper_kernel_is_the_profiled_dispatch(tmp_path):
+    stats = tmp_path / "stats.csv"
+    pmc = tmp_path / "pmc.csv"
+    # Helper wins on TotalDurationNs only. Main has more calls and a shorter
+    # average, and it is the later row.
+    stats.write_text(
+        "Name,Calls,TotalDurationNs,AverageNs,Percentage\n"
+        "at::native::vectorized_elementwise,1,3000,3000,0\n"
+        "triton_helper,2,1000000,500000,56\n"
+        "triton_main,8,800000,100000,44\n"
+    )
+    Path(str(stats) + "_kernel_trace.csv").write_text(
+        "Kind,Kernel_Name,Start_Timestamp,End_Timestamp\n"
+        "KERNEL_DISPATCH,triton_helper,0,500000\n"
+        "KERNEL_DISPATCH,triton_main,500000,600000\n"
+        "KERNEL_DISPATCH,triton_helper,600000,1100000\n"
+        "KERNEL_DISPATCH,triton_main,1100000,1200000\n"
+    )
+    pmc.write_text(
+        "Dispatch_Id,Kernel_Name,Counter_Name,Counter_Value\n"
+        "1,triton_helper,SQ_INSTS_VALU,10\n"
+        "2,triton_main,SQ_INSTS_VALU,900\n"
+        "3,triton_helper,SQ_INSTS_VALU,40\n"
+        "4,triton_main,SQ_INSTS_VALU,800\n"
+    )
+    metrics = _merge_rocprof_outputs(stats, pmc)
+    # Last helper dispatch is 500000 ns. Last main dispatch is 100000 ns.
+    assert metrics["duration_ms"] == pytest.approx(0.5)
+    assert metrics["sq_insts_valu"] == 40.0
 
 
 def test_pmc_keeps_the_last_dispatch_of_the_profiled_kernel(tmp_path):
@@ -1109,12 +1167,60 @@ def test_find_amd_smi_beside_python_before_resolved_path(monkeypatch, tmp_path):
     sibling = link_dir / "amd-smi"
     sibling.write_text("")
     monkeypatch.setattr(
-        "triton_kernel_agent.platform.rocm.shutil.which", lambda _name: None
+        "triton_kernel_agent.platform.rocm.shutil.which",
+        lambda _name: "/usr/bin/amd-smi",
     )
     monkeypatch.setattr(
         "triton_kernel_agent.platform.rocm.sys.executable", str(python)
     )
     assert _find_amd_smi() == str(sibling)
+
+
+def test_find_amd_smi_beside_resolved_python_beats_path(monkeypatch, tmp_path):
+    from triton_kernel_agent.platform.rocm import _find_amd_smi
+
+    link_dir = tmp_path / "venv" / "bin"
+    real_dir = tmp_path / "real"
+    link_dir.mkdir(parents=True)
+    real_dir.mkdir()
+    real_python = real_dir / "python3"
+    real_python.write_text("")
+    python = link_dir / "python"
+    python.symlink_to(real_python)
+    resolved = real_dir / "amd-smi"
+    resolved.write_text("")
+    monkeypatch.setattr(
+        "triton_kernel_agent.platform.rocm.shutil.which",
+        lambda _name: "/usr/bin/amd-smi",
+    )
+    monkeypatch.setattr(
+        "triton_kernel_agent.platform.rocm.sys.executable", str(python)
+    )
+    assert _find_amd_smi() == str(resolved)
+
+
+def test_amd_smi_path_beats_opt_rocm_when_no_sibling(monkeypatch, tmp_path):
+    from triton_kernel_agent.platform.rocm import _find_amd_smi
+
+    python = tmp_path / "python"
+    python.write_text("")
+    bundled = Path("/opt/rocm/bin/amd-smi")
+    monkeypatch.setattr(
+        "triton_kernel_agent.platform.rocm.shutil.which",
+        lambda name: "/usr/bin/amd-smi" if name == "amd-smi" else None,
+    )
+    monkeypatch.setattr(
+        "triton_kernel_agent.platform.rocm.sys.executable", str(python)
+    )
+    real_is_file = Path.is_file
+
+    def is_file(self):
+        if self == bundled:
+            return True
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    assert _find_amd_smi() == "/usr/bin/amd-smi"
 
 
 def test_find_amd_smi_uses_opt_rocm_bin(monkeypatch, tmp_path):
@@ -1418,6 +1524,12 @@ def test_path_binaries_use_nvidia_unless_hip_visible_devices(monkeypatch, tmp_pa
     )
     nvidia.chmod(0o755)
     amd.chmod(0o755)
+    # Lookup checks beside this Python before PATH. Point it at a directory
+    # with no sibling so the fakes above are the binaries under test.
+    monkeypatch.setattr(
+        "triton_kernel_agent.platform.rocm.sys.executable",
+        str(tmp_path / "python"),
+    )
     monkeypatch.setenv("PATH", str(bindir))
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     _hide_rocm_masks(monkeypatch)

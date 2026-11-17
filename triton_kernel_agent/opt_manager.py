@@ -35,7 +35,6 @@ Example:
 
 import logging
 import multiprocessing as mp
-import re
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -49,14 +48,14 @@ from triton_kernel_agent.opt_worker_component.searching.history.models import (
     ProgramEntry,
     ProgramMetrics,
 )
-from triton_kernel_agent.opt_worker_component.searching.strategy.strategy import (
-    SearchStrategy,
-)
 from triton_kernel_agent.opt_worker_component.searching.strategy.beam_search import (
     BeamSearchStrategy,
 )
 from triton_kernel_agent.opt_worker_component.searching.strategy.greedy import (
     GreedyStrategy,
+)
+from triton_kernel_agent.opt_worker_component.searching.strategy.strategy import (
+    SearchStrategy,
 )
 from utils.config_injectable import config_injectable
 
@@ -103,14 +102,6 @@ def _query_smi(argv: list[str]) -> str | None:
     return out.stdout
 
 
-def _parse_amd_smi_gpu_ids(text: str) -> list[int]:
-    """HIP ordinals from ``amd-smi list``. Prefer ``HIP_ID`` over the tool index."""
-    hip_ids = [int(match) for match in re.findall(r"(?m)^\s*HIP_ID:\s*(\d+)\s*$", text)]
-    if hip_ids:
-        return hip_ids
-    return [int(match) for match in re.findall(r"(?m)^GPU:\s*(\d+)\s*$", text)]
-
-
 def _parse_nvidia_smi_gpu_ids(text: str) -> list[int]:
     """GPU indexes from ``nvidia-smi --query-gpu=index``."""
     ids: list[int] = []
@@ -149,7 +140,10 @@ def _uses_nvidia_gpu_list(platform: dict[str, str] | str | None) -> bool:
 
 def _amd_smi_hip_ids() -> list[int] | None:
     """HIP ids from ``amd-smi``. None when the binary cannot be found."""
-    from triton_kernel_agent.platform.rocm import _find_amd_smi
+    from triton_kernel_agent.platform.rocm import (
+        _find_amd_smi,
+        _parse_amd_smi_gpu_ids,
+    )
 
     amd_smi = _find_amd_smi()
     if not amd_smi:

@@ -66,26 +66,30 @@ def detect_amd_gpu_name() -> str | None:
     One ``amd-smi`` ASIC read covers the name and the device id.
 
     Returns:
-        GPU name string, or ``None`` if no AMD GPU is visible.
+        GPU name string. ``None`` when no AMD GPU is visible, or when
+        ``amd-smi`` is missing, fails, or prints no ASIC data. Other
+        exceptions propagate.
     """
     try:
         found = _visible_asic()
-        if found is None:
-            return None
-        asic, listed, hip_id = found
-        index = _parse_amd_smi_hip_index(listed).get(hip_id, hip_id)
-        name = _parse_amd_smi_market_names(asic).get(index)
-        if not name:
-            name = _parse_amd_smi_gfx_versions(asic).get(index)
-        if not name:
-            return None
-        if _gpu_name_needs_chip_id(name):
-            record = _amd_smi_gpu_record(listed, asic, hip_id)
-            chip, cu_count = record if record is not None else (None, None)
-            return _sku_for_torch_name(name, chip, cu_count)
-        return name
-    except Exception:
+    except RuntimeError as exc:
+        if str(exc) != "no GPU visible":
+            raise
         return None
+    if found is None:
+        return None
+    asic, listed, hip_id = found
+    index = _parse_amd_smi_hip_index(listed).get(hip_id, hip_id)
+    name = _parse_amd_smi_market_names(asic).get(index)
+    if not name:
+        name = _parse_amd_smi_gfx_versions(asic).get(index)
+    if not name:
+        return None
+    if _gpu_name_needs_chip_id(name):
+        record = _amd_smi_gpu_record(listed, asic, hip_id)
+        chip, cu_count = record if record is not None else (None, None)
+        return _sku_for_torch_name(name, chip, cu_count)
+    return name
 
 
 # gfx942 is shared by MI300X and MI300A. gfx90a is shared by MI210, MI250,
@@ -207,6 +211,14 @@ def _sku_for_torch_name(
     return raw_name
 
 
+def _parse_amd_smi_gpu_ids(text: str) -> list[int]:
+    """HIP ordinals from ``amd-smi list``. Prefer ``HIP_ID`` over the tool index."""
+    hip_ids = [int(match) for match in re.findall(r"(?m)^\s*HIP_ID:\s*(\d+)\s*$", text)]
+    if hip_ids:
+        return hip_ids
+    return [int(match) for match in re.findall(r"(?m)^GPU:\s*(\d+)\s*$", text)]
+
+
 def _parse_amd_smi_hip_index(text: str) -> dict[int, int]:
     """Map ``HIP_ID`` to the ``amd-smi`` GPU index."""
     index = None
@@ -265,15 +277,20 @@ def _amd_smi_gpu_record(
 
 
 def _find_amd_smi() -> str | None:
-    """Find ``amd-smi`` on PATH, beside Python, or under ``/opt/rocm/bin``."""
-    found = shutil.which("amd-smi")
-    if found:
-        return found
+    """Find ``amd-smi`` beside this Python, then on PATH, then ``/opt/rocm``.
+
+    Same order as ``rocprofv3``. ROCm 10 and later install both beside the
+    Python interpreter. One earlier on PATH can be a different ROCm.
+    ``/opt/rocm/bin/amd-smi`` is the layout from older ROCm.
+    """
     # A venv python is often a symlink. Look beside the symlink first.
     for executable in (Path(sys.executable), Path(sys.executable).resolve()):
         sibling = executable.with_name("amd-smi")
         if sibling.is_file():
             return str(sibling)
+    found = shutil.which("amd-smi")
+    if found:
+        return found
     bundled = Path("/opt/rocm/bin/amd-smi")
     if bundled.is_file():
         return str(bundled)
@@ -376,8 +393,6 @@ def _visible_hip_listing() -> tuple[str, int]:
     A mask that selects nothing, or a listing with no ids, raises.
     ``CUDA_VISIBLE_DEVICES`` is not a HIP id.
     """
-    from triton_kernel_agent.opt_manager import _parse_amd_smi_gpu_ids
-
     for args in (["list", "-e"], ["list"]):
         listed = _run_amd_smi(args)
         if not listed:
