@@ -392,6 +392,84 @@ def test_amd_smi_asic_follows_hip_id():
     assert _amd_smi_gpu_record(listed, asic, 2) == (0x7408, 110)
 
 
+def test_detect_amd_gpu_name_uses_amd_smi_market_name(monkeypatch):
+    from triton_kernel_agent.platform import rocm
+
+    asic = (
+        "GPU: 0\n    MARKET_NAME: AMD Instinct MI250X/MI250\n"
+        "    DEVICE_ID: 0x740c\n    NUM_COMPUTE_UNITS: 104\n"
+    )
+    monkeypatch.setattr(rocm, "_run_amd_smi", lambda args: asic)
+    monkeypatch.setattr(
+        rocm, "_visible_hip_listing", lambda: ("GPU: 0\n    HIP_ID: 3\n", 3)
+    )
+    assert rocm.detect_amd_gpu_name() == "AMD Instinct MI250"
+
+
+def test_detect_amd_gpu_name_uses_gfx_when_market_name_is_missing(monkeypatch):
+    from triton_kernel_agent.platform import rocm
+
+    asic = (
+        "GPU: 0\n    DEVICE_ID: 0x74a1\n    NUM_COMPUTE_UNITS: 304\n"
+        "    TARGET_GRAPHICS_VERSION: gfx942\n"
+    )
+    monkeypatch.setattr(rocm, "_run_amd_smi", lambda args: asic)
+    monkeypatch.setattr(
+        rocm, "_visible_hip_listing", lambda: ("GPU: 0\n    HIP_ID: 0\n", 0)
+    )
+    assert rocm.detect_amd_gpu_name() == "AMD Instinct MI300X"
+
+
+def test_detect_amd_gpu_name_returns_none_without_asic_output(monkeypatch):
+    from triton_kernel_agent.platform import rocm
+
+    monkeypatch.setattr(rocm, "_run_amd_smi", lambda args: None)
+    assert rocm.detect_amd_gpu_name() is None
+
+
+def test_detect_amd_gpu_name_returns_none_without_a_name(monkeypatch):
+    from triton_kernel_agent.platform import rocm
+
+    monkeypatch.setattr(
+        rocm, "_run_amd_smi", lambda args: "GPU: 0\n    DEVICE_ID: 0x740c\n"
+    )
+    monkeypatch.setattr(
+        rocm, "_visible_hip_listing", lambda: ("GPU: 0\n    HIP_ID: 0\n", 0)
+    )
+    assert rocm.detect_amd_gpu_name() is None
+
+
+def test_detect_amd_gpu_name_returns_none_when_no_gpu_is_visible(monkeypatch):
+    from triton_kernel_agent.platform import rocm
+
+    def no_gpu():
+        raise RuntimeError("no GPU visible")
+
+    monkeypatch.setattr(rocm, "_run_amd_smi", lambda args: "GPU: 0\n")
+    monkeypatch.setattr(rocm, "_visible_hip_listing", no_gpu)
+    assert rocm.detect_amd_gpu_name() is None
+
+
+def test_detect_amd_gpu_name_reads_asic_once(monkeypatch):
+    from triton_kernel_agent.platform import rocm
+
+    calls = []
+
+    def run(args):
+        calls.append(tuple(args))
+        return (
+            "GPU: 0\n    MARKET_NAME: AMD Instinct MI250X/MI250\n"
+            "    DEVICE_ID: 0x740c\n    NUM_COMPUTE_UNITS: 104\n"
+        )
+
+    monkeypatch.setattr(rocm, "_run_amd_smi", run)
+    monkeypatch.setattr(
+        rocm, "_visible_hip_listing", lambda: ("GPU: 0\n    HIP_ID: 0\n", 0)
+    )
+    assert rocm.detect_amd_gpu_name() == "AMD Instinct MI250"
+    assert calls == [("static", "--asic")]
+
+
 def test_gfx942_chip_id_separates_mi300a_and_mi300x():
     assert sku_name_for_gfx942_chip(0x74A0) == "AMD Instinct MI300A"
     assert sku_name_for_gfx942_chip(0x74A1) == "AMD Instinct MI300X"

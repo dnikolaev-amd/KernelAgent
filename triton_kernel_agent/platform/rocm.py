@@ -23,8 +23,8 @@ ROCm-specific notes
 - ``torch.cuda`` works on ROCm via the HIP compatibility layer, so CUDA
   event timing, ``torch.cuda.synchronize()``, etc. all work unchanged.
 - Profiling uses ``rocprof`` instead of NVIDIA NCU.
-- GPU names are detected via ``torch.cuda.get_device_name()``; AMD Instinct
-  GPUs return strings like ``"AMD Instinct MI300X"``.
+- GPU names come from ``amd-smi``, not torch. Workers are forked after HIP
+  is already initialized, and a forked child cannot re-initialize it.
 - Wavefront size is 64 (vs 32 for NVIDIA warps).
 """
 
@@ -56,30 +56,32 @@ from triton_kernel_agent.platform.worker_runner import ROCmWorkerRunner  # noqa:
 
 
 def detect_amd_gpu_name() -> str | None:
-    """Detect the AMD GPU name via ``torch.cuda.get_device_name()``.
+    """Name of the first visible HIP device, from ``amd-smi``.
 
-    On ROCm, PyTorch's CUDA layer is backed by HIP, and
-    ``torch.cuda.get_device_name()`` returns the real AMD GPU name
-    (e.g., ``"AMD Instinct MI300X"``).
+    Does not import torch. The manager initializes HIP before it forks
+    workers, and a forked child cannot re-initialize HIP.
+
+    ``MARKET_NAME`` is used when amd-smi prints one. Otherwise the ISA from
+    ``TARGET_GRAPHICS_VERSION`` is used. A shared name is split by device id.
+    One ``amd-smi`` ASIC read covers the name and the device id.
 
     Returns:
-        GPU name string, or ``None`` if no GPU is found or the GPU is NVIDIA.
+        GPU name string, or ``None`` if no AMD GPU is visible.
     """
     try:
-        import torch
-
-        if not torch.cuda.is_available():
+        found = _visible_asic()
+        if found is None:
             return None
-        name = torch.cuda.get_device_name(0)
-        lowered = name.lower()
-        if not (
-            "AMD" in name or "Instinct" in name or "Radeon" in name or "gfx" in lowered
-        ):
+        asic, listed, hip_id = found
+        index = _parse_amd_smi_hip_index(listed).get(hip_id, hip_id)
+        name = _parse_amd_smi_market_names(asic).get(index)
+        if not name:
+            name = _parse_amd_smi_gfx_versions(asic).get(index)
+        if not name:
             return None
-        # "MI250X / MI250" and a bare gfx90a or gfx942 name cover more than
-        # one product. amd-smi's device id picks the spec row.
         if _gpu_name_needs_chip_id(name):
-            chip, cu_count = _amd_smi_chip_id_and_cu_count()
+            record = _amd_smi_gpu_record(listed, asic, hip_id)
+            chip, cu_count = record if record is not None else (None, None)
             return _sku_for_torch_name(name, chip, cu_count)
         return name
     except Exception:
@@ -128,7 +130,7 @@ def _names_both_mi250_products(raw_name: str) -> bool:
 
 
 def _gpu_name_needs_chip_id(raw_name: str) -> bool:
-    """True when the torch string does not name a single spec row."""
+    """True when the detected name does not name a single spec row."""
     if _names_both_mi250_products(raw_name):
         return True
     if _named_sku(raw_name) is not None:
@@ -193,7 +195,11 @@ def _sku_for_torch_name(
     chip_id: int | None,
     cu_count: int | None,
 ) -> str:
-    """Resolve a torch device name, using the chip id when the name is shared."""
+    """Resolve a detected name, using the chip id when the name is shared.
+
+    ``raw_name`` is an amd-smi ``MARKET_NAME``, a ``TARGET_GRAPHICS_VERSION``,
+    or an explicit ``gpu_name``.
+    """
     if _gpu_name_needs_chip_id(raw_name):
         sku = sku_name_for_chip(chip_id, cu_count)
         if sku is not None:
@@ -386,31 +392,67 @@ def _visible_hip_listing() -> tuple[str, int]:
     raise RuntimeError("no GPU visible")
 
 
-def _amd_smi_chip_id_and_cu_count() -> tuple[int | None, int | None]:
-    """Device id and CU count from ``amd-smi``, or ``(None, None)``."""
+def _visible_asic() -> tuple[str, str, int] | None:
+    """ASIC text, device list, and the first visible HIP id.
+
+    ``None`` when ``amd-smi`` writes no ASIC output. A visibility mask that
+    selects nothing raises from :func:`_visible_hip_listing`.
+    """
     asic = _run_amd_smi(["static", "--asic"])
     if not asic:
-        return None, None
+        return None
     listed, hip_id = _visible_hip_listing()
+    return asic, listed, hip_id
+
+
+def _amd_smi_chip_id_and_cu_count() -> tuple[int | None, int | None]:
+    """Device id and CU count from ``amd-smi``, or ``(None, None)``."""
+    found = _visible_asic()
+    if found is None:
+        return None, None
+    asic, listed, hip_id = found
     record = _amd_smi_gpu_record(listed, asic, hip_id)
     if record is None:
         return None, None
     return record
 
 
+def _parse_amd_smi_field(text: str, field: str) -> dict[int, str]:
+    """Map an ``amd-smi`` GPU index to one ASIC field."""
+    index = None
+    values: dict[int, str] = {}
+    pattern = re.compile(rf"^\s*{field}:\s*(.+?)\s*$")
+    for line in text.splitlines():
+        gpu = re.match(r"^GPU:\s*(\d+)\s*$", line)
+        if gpu:
+            index = int(gpu.group(1))
+            continue
+        match = pattern.match(line)
+        if match is not None and index is not None:
+            values[index] = match.group(1)
+    return values
+
+
+def _parse_amd_smi_market_names(text: str) -> dict[int, str]:
+    """Map an ``amd-smi`` GPU index to its ``MARKET_NAME``."""
+    return _parse_amd_smi_field(text, "MARKET_NAME")
+
+
+def _parse_amd_smi_gfx_versions(text: str) -> dict[int, str]:
+    """Map an ``amd-smi`` GPU index to ``TARGET_GRAPHICS_VERSION``."""
+    return _parse_amd_smi_field(text, "TARGET_GRAPHICS_VERSION")
+
+
 def _normalize_amd_gpu_name(raw_name: str) -> str:
-    """Normalize the raw torch GPU name to a key in the GPU specs database.
+    """Map a detected GPU name to a key in the GPU specs database.
 
-    ``torch.cuda.get_device_name()`` may return strings like
-    ``"AMD Instinct MI300X OAM"``, ``"Instinct MI300X"``, or ``"gfx942"``.
-    We strip the OAM/PCIe suffix, map bare ISA names, and ensure the
-    ``"AMD Instinct"`` prefix.
+    The name comes from amd-smi (``MARKET_NAME`` or
+    ``TARGET_GRAPHICS_VERSION``) or from an explicit ``gpu_name``.
+    Form-factor suffixes are stripped, bare ISA names such as ``gfx942``
+    are mapped, and a missing ``AMD`` prefix is added.
 
-    Args:
-        raw_name: Raw name from ``torch.cuda.get_device_name()``.
-
-    Returns:
-        Normalized name string.
+    A combined ``MI250X/MI250`` string stays ``MI250X``. ``detect_amd_gpu_name``
+    splits that with the chip id. An explicit ``gpu_name`` does not.
     """
     # Strip trailing form-factor suffixes
     for suffix in (" OAM", " PCIe", " SXM", " NVL"):
@@ -573,8 +615,8 @@ class ROCmBenchmarker(KernelBenchmarker):
 class ROCmAcceleratorSpecsProvider(AcceleratorSpecsProvider):
     """Looks up AMD GPU specs from the GPU specs database.
 
-    Auto-detects the GPU name via ``torch.cuda.get_device_name()`` when
-    ``device_name`` is not provided.
+    Auto-detects the GPU name from ``amd-smi`` when ``device_name`` is
+    not provided.
     """
 
     def get_specs(self, device_name: str | None = None) -> dict[str, Any]:
